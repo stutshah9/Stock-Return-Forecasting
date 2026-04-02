@@ -15,4 +15,3 @@ data/processed/*
 cal_outputs.pt
 events_cache.pt
 transcripts.csv
-model.pt
