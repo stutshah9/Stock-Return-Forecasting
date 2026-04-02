@@ -25,33 +25,76 @@ If you use Reddit scraping through the public JSON endpoint, no API key is requi
 The pipeline is split into:
 
 1. `experiments/train.py`
-   Trains the model on the chronological training split and saves:
-   `experiments/model.pt`
-   `data/cal_outputs.pt`
+  Trains the model on cached events and saves:
+  `experiments/model.pt`
+  `data/cal_outputs.pt`
+
+  For compatibility with older tests/scripts, it also writes:
+  `model.pt`
+  `cal_outputs.pt`
 
 2. `experiments/evaluate.py`
-   Loads the saved model and calibration outputs, calibrates conformal thresholds,
-   evaluates on the held-out test split, prints a comparison table, and saves:
-   `experiments/results.csv`
+  Loads cached events plus saved model/calibration outputs, calibrates conformal
+  thresholds, evaluates on the held-out test split, prints a comparison table,
+  and saves:
+  `experiments/results.csv`
 
-By default, the config is now set to:
+  For compatibility with older tests/scripts, it also writes:
+  `results.csv`
 
-- universe: `sp500`
-- calibration years: `2024`
-- test years: `2025`
-- training years: everything earlier than the calibration/test years
+Current split behavior in code:
+
+- train years: `<= 2023`
+- calibration year: `2024`
+- test year: `2025`
+
+Note: while `config.yaml` contains a `data.split` block, current train/evaluate
+scripts use the fixed year split above.
 
 ## Quick Sanity Check
 
-Run a dry-run that uses a tiny synthetic dataset and only 2 batches of 2 samples:
+Run a dry-run training pass that uses a tiny synthetic dataset and only 2 batches of 2 samples:
 
 ```bash
 cd /Users/Stuti/Stock-Return-Forecasting
 python3 experiments/train.py --dry-run
+```
+
+This is the fastest way to verify model construction, forward pass, loss, and artifact writing.
+
+To run full evaluation, you must have `data/events_cache.pt` available (see "Run End To End").
+
+## Run End To End
+
+Use this sequence from a clean clone:
+
+```bash
+cd /Users/Stuti/Stock-Return-Forecasting
+python3 -m pip install -r requirements.txt
+
+# Optional: refresh source CSVs
+python3 data/collect_real_data.py
+python3 data/download_transcripts_hf.py
+
+# Build event cache used by train/evaluate
+python3 data/build_cache.py
+
+# Train + evaluate
+python3 experiments/train.py
 python3 experiments/evaluate.py
 ```
 
-This is the fastest way to verify the pipeline end to end.
+Expected outputs after successful run:
+
+- `experiments/model.pt`
+- `data/cal_outputs.pt`
+- `experiments/results.csv`
+
+Compatibility outputs also written:
+
+- `model.pt`
+- `cal_outputs.pt`
+- `results.csv`
 
 ## Collect Real Financials
 
@@ -117,13 +160,18 @@ python3 experiments/train.py
 
 What happens:
 
-- local events are loaded from the transcript and financial CSV indexes
+- cached events are loaded from `data/events_cache.pt`
 - events are filtered to the configured universe, currently `sp500`
-- events are split by year from `config.yaml`
+- events are split with current fixed code logic: train `<= 2023`, calibration `2024`, test `2025`
 - only the training split is used for gradient updates
 - the calibration split is never used during training
 - model weights are saved to `experiments/model.pt`
 - calibration outputs are saved to `data/cal_outputs.pt`
+
+Compatibility artifacts also saved to project root:
+
+- `model.pt`
+- `cal_outputs.pt`
 
 Important:
 
@@ -168,10 +216,10 @@ And saves the CSV to:
 experiments/results.csv
 ```
 
-If you intentionally want the old synthetic smoke-test behavior when real 2025 data is unavailable, run:
+Compatibility artifact also saved to project root:
 
-```bash
-python3 experiments/evaluate.py --allow-synthetic-fallback
+```text
+results.csv
 ```
 
 ## Mass Train And Test
@@ -216,6 +264,7 @@ done
 - `config.yaml`: hyperparameters and split settings
 - `data/transcripts.csv`: transcript source data
 - `data/financials.csv`: structured feature source data
+- `data/build_cache.py`: builds `data/events_cache.pt`
 - `data/loader.py`: event construction
 - `data/dataset.py`: dataset wrapper
 - `models/fusion_model.py`: multimodal model
