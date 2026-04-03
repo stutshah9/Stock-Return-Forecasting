@@ -66,15 +66,15 @@ class TranscriptEncoder(nn.Module):
         self.projection = nn.Linear(self.backbone.config.hidden_size, embed_dim)
 
         if self.frozen:
-            for parameter in self.parameters():
+            for parameter in self.backbone.parameters():  # was: self.parameters()
                 parameter.requires_grad = False
 
             # Unfreeze last 2 encoder layers for domain adaptation
-            for name, param in self.bert.named_parameters():
+            for name, param in self.backbone.named_parameters():  # was: self.bert.named_parameters()
                 if "encoder.layer.11" in name or "encoder.layer.10" in name:
                     param.requires_grad = True
 
-            if not any(param.requires_grad for param in self.bert.parameters()):
+            if not any(param.requires_grad for param in self.backbone.parameters()):  # was: self.bert.parameters()
                 self.backbone.eval()
 
         if self.cache_dir is not None:
