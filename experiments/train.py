@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import sys
@@ -33,6 +34,7 @@ from models.fusion_model import MultimodalForecastModel
 
 _CLI_DRY_RUN = False
 EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
+FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -55,14 +57,18 @@ def _build_dry_run_events() -> list[dict[str, Any]]:
     """Build a small synthetic dataset for end-to-end dry-run verification."""
 
     normalized_events: list[dict[str, Any]] = []
-    for event in _shared_build_synthetic_events():
+    dry_run_years = [2021, 2022, 2023, 2024, 2025, 2025]
+    for index, event in enumerate(_shared_build_synthetic_events()):
         raw_posts = [str(post) for post in list(event.get("sentiment_posts", []))]
         sentiment_features = aggregate_posts(raw_posts)
         raw_features = event.get("features", {})
+        original_date = str(event.get("date", "2023-01-01"))
+        adjusted_year = dry_run_years[min(index, len(dry_run_years) - 1)]
+        adjusted_date = f"{adjusted_year}{original_date[4:]}"
         normalized_events.append(
             {
                 "ticker": str(event.get("ticker", "")).upper(),
-                "date": str(event.get("date", "")),
+                "date": adjusted_date,
                 "transcript": str(event.get("transcript", "")),
                 "features": [
                     float(raw_features.get("sue", 0.0)),
@@ -75,7 +81,7 @@ def _build_dry_run_events() -> list[dict[str, Any]]:
                     float(sentiment_features[1].item()),
                 ],
                 "label": float(event.get("label", 0.0)),
-                "year": int(str(event.get("date", ""))[:4]),
+                "year": adjusted_year,
             }
         )
     return normalized_events
@@ -101,14 +107,17 @@ def _split_events_by_year(
     """Split cached events into fixed year-based train/calibration/test partitions."""
 
     sorted_events = sorted(events, key=lambda event: (int(event["year"]), str(event["date"])))
-    train_events = [event for event in sorted_events if int(event["year"]) <= 2023]
-    cal_events = [event for event in sorted_events if int(event["year"]) == 2024]
+    train_events = [event for event in sorted_events if int(event["year"]) <= 2022]
+    cal_events = [
+        event for event in sorted_events if int(event["year"]) in {2023, 2024}
+    ]
     test_events = [event for event in sorted_events if int(event["year"]) == 2025]
 
     if not train_events or not cal_events or not test_events:
         raise ValueError(
             "Year-based cache split produced an empty partition. "
-            "Expected train years <= 2023, calibration year 2024, and test year 2025."
+            "Expected train years <= 2022, calibration years 2023-2024, "
+            "and test year 2025."
         )
     return train_events, cal_events, test_events
 
@@ -120,7 +129,7 @@ def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     financial = torch.stack([item["features"].float() for item in batch], dim=0)
     sentiment = torch.stack([item["sentiment"].float() for item in batch], dim=0)
     labels = torch.stack([item["label"].float() for item in batch], dim=0).view(-1)
-    regimes = [assign_regime(float(item["features"][0].item())) for item in batch]
+    regimes = [assign_regime(float(item["raw_features"][0].item())) for item in batch]
     return {
         "transcripts": transcripts,
         "financial": financial,
@@ -293,9 +302,14 @@ def train(config_path: str) -> None:
     except Exception as exc:
         raise ValueError(f"Could not build the requested split. {exc}") from exc
 
-    train_dataset = EarningsDataset(train_events)
-    cal_dataset = EarningsDataset(cal_events)
-    test_dataset = EarningsDataset(test_events)
+    feature_stats = EarningsDataset.compute_feature_stats(train_events)
+    FEATURE_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with FEATURE_STATS_PATH.open("w", encoding="utf-8") as stats_file:
+        json.dump(feature_stats, stats_file)
+
+    train_dataset = EarningsDataset(train_events, feature_stats=feature_stats)
+    cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
+    test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
 
     train_loader = DataLoader(
         train_dataset,

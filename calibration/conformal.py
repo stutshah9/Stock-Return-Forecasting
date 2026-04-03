@@ -171,7 +171,7 @@ class EventConditionedConformalPredictor:
 
         threshold = self.thresholds[threshold_key]
         base_half_width = threshold * math.exp(log_sigma)
-        adjustment = 1.0 + 0.5 * (1.0 - introspective_score)
+        adjustment = 1.0 + 0.15 * (1.0 - introspective_score)
         adjusted_half_width = base_half_width * adjustment
 
         return mu - adjusted_half_width, mu + adjusted_half_width

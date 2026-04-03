@@ -68,16 +68,29 @@ class TranscriptEncoder(nn.Module):
         if self.frozen:
             for parameter in self.parameters():
                 parameter.requires_grad = False
-            self.backbone.eval()
+
+            # Unfreeze last 2 encoder layers for domain adaptation
+            for name, param in self.bert.named_parameters():
+                if "encoder.layer.11" in name or "encoder.layer.10" in name:
+                    param.requires_grad = True
+
+            if not any(param.requires_grad for param in self.bert.parameters()):
+                self.backbone.eval()
 
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def bert(self) -> nn.Module:
+        """Compatibility alias for the FinBERT backbone module."""
+
+        return self.backbone
 
     def train(self, mode: bool = True) -> TranscriptEncoder:
         """Set training mode while keeping a frozen backbone in eval mode."""
 
         super().train(mode)
-        if self.frozen:
+        if self.frozen and not any(param.requires_grad for param in self.bert.parameters()):
             self.backbone.eval()
         return self
 
@@ -94,7 +107,7 @@ class TranscriptEncoder(nn.Module):
     def _cache_path(self, index: int) -> Path | None:
         """Return the cache path for a transcript index, if caching is enabled."""
 
-        if self.cache_dir is None or not self.frozen:
+        if self.cache_dir is None or any(param.requires_grad for param in self.bert.parameters()):
             return None
         if self.cache_keys is None or index >= len(self.cache_keys):
             return None
@@ -180,7 +193,11 @@ class TranscriptEncoder(nn.Module):
         chunk_token_ids = self._chunk_token_ids(token_ids)
         model_inputs = self._prepare_chunk_batch(chunk_token_ids)
 
-        context_manager = torch.no_grad() if self.frozen else nullcontext()
+        context_manager = (
+            torch.no_grad()
+            if not any(param.requires_grad for param in self.bert.parameters())
+            else nullcontext()
+        )
         with context_manager:
             outputs = self.backbone(**model_inputs)
 

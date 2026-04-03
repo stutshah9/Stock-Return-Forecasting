@@ -265,8 +265,11 @@ def build_cache(
     }
 
     print(f"total events cached: {len(merged_events)}")
-    print(f"train (year <= 2023): {sum(1 for year in years_covered if year <= 2023)}")
-    print(f"calibration (2024):   {sum(1 for year in years_covered if year == 2024)}")
+    print(f"train (year <= 2022): {sum(1 for year in years_covered if year <= 2022)}")
+    print(
+        f"calibration (2023-2024): "
+        f"{sum(1 for year in years_covered if year in {2023, 2024})}"
+    )
     print(f"test (2025):          {sum(1 for year in years_covered if year == 2025)}")
     print(f"tickers covered:      {len(tickers_covered)}")
     print(f"skipped (NaN):        {skipped_nan}")

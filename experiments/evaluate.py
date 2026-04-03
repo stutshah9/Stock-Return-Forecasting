@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import sys
@@ -20,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from calibration.conformal import EventConditionedConformalPredictor, assign_regime
+from data.dataset import EarningsDataset
 from data.event_utils import (
     filter_events_by_universe,
     summarize_event_coverage,
@@ -28,6 +30,7 @@ from models.fusion_model import MultimodalForecastModel
 
 
 EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
+FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -111,19 +114,37 @@ def _load_cached_events() -> list[dict[str, Any]]:
     return events
 
 
+def _load_feature_stats() -> dict[str, list[float]]:
+    """Load feature normalization statistics produced during training."""
+
+    if not FEATURE_STATS_PATH.is_file():
+        raise FileNotFoundError(
+            "experiments/feature_stats.json not found. "
+            "Run: python3 experiments/train.py first."
+        )
+    with FEATURE_STATS_PATH.open("r", encoding="utf-8") as stats_file:
+        stats = json.load(stats_file)
+    if not isinstance(stats, dict) or "mean" not in stats or "std" not in stats:
+        raise ValueError("experiments/feature_stats.json is malformed.")
+    return stats
+
+
 def _split_events_by_year(
     events: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split cached events into fixed year-based train/calibration/test partitions."""
 
     sorted_events = sorted(events, key=lambda event: (int(event["year"]), str(event["date"])))
-    train_events = [event for event in sorted_events if int(event["year"]) <= 2023]
-    cal_events = [event for event in sorted_events if int(event["year"]) == 2024]
+    train_events = [event for event in sorted_events if int(event["year"]) <= 2022]
+    cal_events = [
+        event for event in sorted_events if int(event["year"]) in {2023, 2024}
+    ]
     test_events = [event for event in sorted_events if int(event["year"]) == 2025]
     if not train_events or not cal_events or not test_events:
         raise ValueError(
             "Year-based cache split produced an empty partition. "
-            "Expected train years <= 2023, calibration year 2024, and test year 2025."
+            "Expected train years <= 2022, calibration years 2023-2024, "
+            "and test year 2025."
         )
     return train_events, cal_events, test_events
 
@@ -132,6 +153,11 @@ def _feature_triplet(event: dict[str, Any]) -> list[float]:
     """Extract a three-value financial feature list from a cached event."""
 
     raw_features = event.get("features", [])
+    if isinstance(raw_features, torch.Tensor):
+        values = [float(value) for value in raw_features.detach().cpu().view(-1).tolist()[:3]]
+        while len(values) < 3:
+            values.append(0.0)
+        return values
     if isinstance(raw_features, dict):
         return [
             float(raw_features.get("sue", 0.0)),
@@ -150,8 +176,15 @@ def _feature_triplet(event: dict[str, Any]) -> list[float]:
 def _sentiment_pair(event: dict[str, Any]) -> list[float]:
     """Extract a two-value cached sentiment feature list from an event."""
 
+    raw_sentiment = event.get("sentiment", event.get("sentiment_features", []))
+    if isinstance(raw_sentiment, torch.Tensor):
+        values = [float(value) for value in raw_sentiment.detach().cpu().view(-1).tolist()[:2]]
+        while len(values) < 2:
+            values.append(0.0)
+        return values
+
     values: list[float] = []
-    for sentiment_value in list(event.get("sentiment_features", []))[:2]:
+    for sentiment_value in list(raw_sentiment)[:2]:
         values.append(float(sentiment_value))
     while len(values) < 2:
         values.append(0.0)
@@ -161,6 +194,11 @@ def _sentiment_pair(event: dict[str, Any]) -> list[float]:
 def _event_sue(event: dict[str, Any]) -> float:
     """Extract the cached SUE value used for regime assignment."""
 
+    raw_features = event.get("raw_features")
+    if isinstance(raw_features, torch.Tensor):
+        return float(raw_features.detach().cpu().view(-1)[0].item())
+    if isinstance(raw_features, (list, tuple)) and raw_features:
+        return float(raw_features[0])
     return float(_feature_triplet(event)[0])
 
 
@@ -297,44 +335,32 @@ def _compute_model_outputs(
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
 
 
-def _historical_sigma(
+def _same_ticker_baseline_parameters(
     ticker: str,
-    event_date: str,
-    historical_events: list[dict[str, Any]],
-) -> float:
-    """Estimate historical post-earnings return volatility for a ticker."""
+    training_events: list[dict[str, Any]],
+) -> tuple[float, float]:
+    """Estimate same-ticker baseline mean and volatility from training labels."""
 
-    current_date = pd.Timestamp(event_date)
     same_ticker_returns = [
         float(event["label"])
-        for event in historical_events
+        for event in training_events
         if str(event.get("ticker", "")).upper() == ticker.upper()
-        and pd.Timestamp(event["date"]) < current_date
         and not math.isnan(float(event.get("label", math.nan)))
     ]
     if len(same_ticker_returns) >= 2:
+        mu = float(np.mean(same_ticker_returns))
         sigma = float(np.std(same_ticker_returns, ddof=1))
         if sigma > 0.0:
-            return sigma
-
-    all_returns = [
-        float(event["label"])
-        for event in historical_events
-        if pd.Timestamp(event["date"]) < current_date
-        and not math.isnan(float(event.get("label", math.nan)))
-    ]
-    if len(all_returns) >= 2:
-        sigma = float(np.std(all_returns, ddof=1))
-        if sigma > 0.0:
-            return sigma
-    return 0.02
+            return mu, sigma
+        return mu, 0.02
+    return 0.0, 0.02
 
 
 def _compute_same_ticker_baseline(
     test_events: list[dict[str, Any]],
-    historical_events: list[dict[str, Any]],
+    training_events: list[dict[str, Any]],
 ) -> tuple[list[dict[str, float]], list[float], list[str], list[str]]:
-    """Build a zero-mean same-ticker volatility baseline."""
+    """Build a same-ticker historical-mean and volatility baseline."""
 
     outputs: list[dict[str, float]] = []
     labels: list[float] = []
@@ -343,10 +369,10 @@ def _compute_same_ticker_baseline(
 
     for event in test_events:
         ticker = str(event.get("ticker", "")).upper()
-        sigma = _historical_sigma(ticker, str(event.get("date", "")), historical_events)
+        mu, sigma = _same_ticker_baseline_parameters(ticker, training_events)
         outputs.append(
             {
-                "mu": 0.0,
+                "mu": float(mu),
                 "log_sigma": float(math.log(max(sigma, 1e-6))),
                 "introspective_score": 1.0,
             }
@@ -406,14 +432,26 @@ def _metric_row(
     mu_values = [float(output["mu"]) for output in outputs]
     mae = float(np.mean([abs(mu - y) for mu, y in zip(mu_values, labels)]))
     rmse = float(np.sqrt(np.mean([(mu - y) ** 2 for mu, y in zip(mu_values, labels)])))
-    dir_acc = float(
-        np.mean(
-            [
-                1.0 if np.sign(mu) == np.sign(y) else 0.0
-                for mu, y in zip(mu_values, labels)
-            ]
+    if method == "same_ticker_baseline":
+        dir_acc = float(
+            np.mean(
+                [
+                    1.0
+                    if (1 if mu >= 0.0 else -1) == (1 if y >= 0.0 else -1)
+                    else 0.0
+                    for mu, y in zip(mu_values, labels)
+                ]
+            )
         )
-    )
+    else:
+        dir_acc = float(
+            np.mean(
+                [
+                    1.0 if np.sign(mu) == np.sign(y) else 0.0
+                    for mu, y in zip(mu_values, labels)
+                ]
+            )
+        )
 
     for output, label, regime in zip(outputs, labels, regimes):
         for coverage in coverages:
@@ -475,6 +513,7 @@ def evaluate(config_path: str) -> None:
     config_file = _resolve_path(config_path)
     config = _load_config(config_file)
     data_config = config.get("data", {})
+    feature_stats = _load_feature_stats()
     all_events = _load_cached_events()
     all_events = filter_events_by_universe(all_events, data_config.get("universe"))
     if not all_events:
@@ -487,6 +526,10 @@ def evaluate(config_path: str) -> None:
         train_events, cal_events, test_events = _split_events_by_year(all_events)
     except Exception as exc:
         raise ValueError(f"Could not build the requested evaluation split. {exc}") from exc
+    cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
+    test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
+    cal_samples = [cal_dataset[index] for index in range(len(cal_dataset))]
+    test_samples = [test_dataset[index] for index in range(len(test_dataset))]
 
     device = _select_device(config)
     print(f"Using device: {device}")
@@ -494,11 +537,8 @@ def evaluate(config_path: str) -> None:
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
     model_path = PROJECT_ROOT / "experiments" / "model.pt"
-    cal_outputs_path = PROJECT_ROOT / "data" / "cal_outputs.pt"
     if not model_path.is_file():
         model_path = PROJECT_ROOT / "model.pt"
-    if not cal_outputs_path.is_file():
-        cal_outputs_path = PROJECT_ROOT / "cal_outputs.pt"
 
     model = MultimodalForecastModel.load_from_config(str(config_file))
     state_dict = torch.load(model_path, map_location="cpu")
@@ -507,10 +547,12 @@ def evaluate(config_path: str) -> None:
     model.to(device)
     _log_device_diagnostics(device, model)
 
-    saved_calibration = torch.load(cal_outputs_path, map_location="cpu")
-    cal_outputs = saved_calibration["outputs"]
-    cal_labels = saved_calibration["labels"]
-    cal_regimes = saved_calibration["regimes"]
+    cal_outputs, cal_labels, cal_regimes, _ = _compute_model_outputs(
+        model=model,
+        events=cal_samples,
+        method="full_multimodal",
+        device=device,
+    )
 
     coverage_levels = list(config.get("calibration", {}).get("coverage_levels", [0.80, 0.90, 0.95]))
     predictor = EventConditionedConformalPredictor(coverage_levels=coverage_levels)
@@ -535,7 +577,7 @@ def evaluate(config_path: str) -> None:
         base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
         outputs, labels, regimes, _tickers = _compute_model_outputs(
             model=model,
-            events=test_events,
+            events=test_samples,
             method=base_method,
             device=device,
         )
@@ -553,7 +595,7 @@ def evaluate(config_path: str) -> None:
 
     baseline_outputs, baseline_labels, baseline_regimes, _baseline_tickers = _compute_same_ticker_baseline(
         test_events=test_events,
-        historical_events=historical_events,
+        training_events=train_events,
     )
     results_rows.append(
         _metric_row(

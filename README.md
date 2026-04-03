@@ -271,3 +271,17 @@ done
 - `calibration/conformal.py`: conformal interval logic
 - `experiments/train.py`: training entry point
 - `experiments/evaluate.py`: evaluation entry point
+
+# upload data to ARC
+rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
+
+# run on ARC
+- ssh stutishah9@falcon2.arc.vt.edu
+- srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:l40s:1      --pty bash -l
+- source .venv/bin/activate
+- cd earnings_forecast/
+- python3 experiments/train.py
+- python3 experiments/evaluate.py
+
+# pull data from ARC
+rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ /Users/Stuti/Stock-Return-Forecasting/
