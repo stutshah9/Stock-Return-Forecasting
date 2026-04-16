@@ -269,10 +269,6 @@ def _fetch_surprises_for_ticker(
             continue
 
         earnings_surprise = float(actual - estimated)
-        if estimated == 0.0:
-            sue = 0.0
-        else:
-            sue = float(earnings_surprise / abs(estimated))
 
         implied_vol, momentum = _compute_yfinance_financial_metrics(
             ticker=ticker,
@@ -286,7 +282,9 @@ def _fetch_surprises_for_ticker(
                 "earnings_surprise": earnings_surprise,
                 "estimated_earnings": float(estimated),
                 "actual_earnings": float(actual),
-                "sue": float(sue),
+                # SUE is recomputed later from each ticker's historical surprise
+                # dispersion so it remains standardized and leakage-safe.
+                "sue": math.nan,
                 "implied_vol": implied_vol,
                 "momentum": momentum,
             }
@@ -467,6 +465,52 @@ def _update_financial_volatility(financials_df: pd.DataFrame) -> pd.DataFrame:
     return updated
 
 
+def _recompute_sue(financials_df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute SUE from prior same-ticker earnings surprises only.
+
+    This standardizes each event's earnings surprise by the sample standard
+    deviation of that ticker's *prior* surprise history, avoiding look-ahead
+    leakage from future earnings events.
+    """
+
+    if financials_df.empty:
+        return financials_df
+
+    updated = financials_df.copy()
+    updated["ticker"] = updated["ticker"].astype(str).str.upper()
+    updated["date"] = pd.to_datetime(updated["date"], errors="coerce")
+    updated["earnings_surprise"] = pd.to_numeric(
+        updated["earnings_surprise"],
+        errors="coerce",
+    )
+    updated["sue"] = 0.0
+
+    for _, ticker_rows in updated.groupby("ticker", sort=False):
+        ordered_rows = ticker_rows.sort_values("date")
+        prior_surprises: list[float] = []
+
+        for row_index, row in ordered_rows.iterrows():
+            current_surprise = _safe_float(row.get("earnings_surprise"))
+            if math.isnan(current_surprise):
+                updated.at[row_index, "sue"] = 0.0
+                continue
+
+            if len(prior_surprises) >= 2:
+                std_dev = float(pd.Series(prior_surprises, dtype="float64").std(ddof=1))
+                if not math.isnan(std_dev) and std_dev > 0.0:
+                    updated.at[row_index, "sue"] = float(current_surprise / std_dev)
+                else:
+                    updated.at[row_index, "sue"] = 0.0
+            else:
+                updated.at[row_index, "sue"] = 0.0
+
+            prior_surprises.append(current_surprise)
+
+    updated["date"] = updated["date"].dt.strftime("%Y-%m-%d")
+    updated["sue"] = pd.to_numeric(updated["sue"], errors="coerce").fillna(0.0)
+    return updated
+
+
 def _coverage_summary(financials_df: pd.DataFrame) -> str:
     """Build the end-of-run financial coverage summary string."""
 
@@ -513,6 +557,7 @@ def collect_real_data(tickers: list[str], years: list[int]) -> None:
                 new_financials,
                 subset=["ticker", "date"],
             )
+            financials_df = _recompute_sue(financials_df)
             _save_financials(financials_df)
         except Exception as exc:
             _log_error(ticker, f"financials: {exc}")
@@ -521,6 +566,7 @@ def collect_real_data(tickers: list[str], years: list[int]) -> None:
         time.sleep(YFINANCE_SLEEP_SECONDS)
 
     financials_df = _update_financial_volatility(financials_df)
+    financials_df = _recompute_sue(financials_df)
     _save_financials(financials_df)
     print(
         "rows added this run:"

@@ -7,7 +7,13 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from data.dataset import EarningsDataset
-from data.loader import _reddit_json, fetch_reddit_posts, load_earnings_event
+from data.loader import (
+    _load_financial_features,
+    _reddit_json,
+    _reddit_window_bounds,
+    fetch_reddit_posts,
+    load_earnings_event,
+)
 
 
 def _write_fixtures(root: str) -> None:
@@ -36,6 +42,7 @@ def _write_fixtures(root: str) -> None:
                 "earnings_surprise": 0.08,
                 "std_dev_surprise": 0.04,
                 "implied_vol": 0.32,
+                "momentum": 0.11,
             },
             {
                 "ticker": "AAPL",
@@ -43,6 +50,7 @@ def _write_fixtures(root: str) -> None:
                 "earnings_surprise": 0.03,
                 "std_dev_surprise": 0.05,
                 "implied_vol": 0.29,
+                "momentum": -0.07,
             },
         ]
     )
@@ -98,6 +106,11 @@ def main() -> None:
     print("Loaded event date:", event["date"])
     print("Loaded event feature keys:", sorted(list(event["features"].keys())))
     print("Loaded event label:", event["label"])
+    assert sorted(list(event["features"].keys())) == [
+        "implied_vol",
+        "momentum",
+        "sue",
+    ], "Feature keys must contain sue, momentum, and implied_vol"
 
     # Step D
     event_2 = load_earnings_event("AAPL", "2023-05-04")
@@ -116,6 +129,14 @@ def main() -> None:
     assert isinstance(item["label"], torch.Tensor), "label must be a Tensor"
     assert item["label"].shape == (), "label must be a scalar tensor"
     assert item["label"].dtype == torch.float32, "label dtype must be float32"
+
+    features_1 = _load_financial_features("AAPL", pd.Timestamp("2023-02-02"))
+    assert abs(features_1["sue"] - 2.0) < 1e-6, "SUE fallback should use std_dev_surprise when available"
+    assert abs(features_1["momentum"] - 0.11) < 1e-6, "Momentum should be loaded from financials.csv"
+    assert abs(features_1["implied_vol"] - 0.32) < 1e-6, "Implied vol should be loaded from financials.csv"
+
+    lower_bound, upper_bound = _reddit_window_bounds(pd.Timestamp("2023-02-02"))
+    assert upper_bound - lower_bound == (2 * 86400) - 1, "Reddit window should span the prior day and event day only"
 
     _ = fetch_reddit_posts("AAPL", "2023-02-02")
 

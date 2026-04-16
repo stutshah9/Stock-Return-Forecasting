@@ -65,6 +65,20 @@ def _to_unix_timestamp(date_value: pd.Timestamp) -> int:
     return int(timestamp.timestamp())
 
 
+def _reddit_window_bounds(event_date: pd.Timestamp) -> tuple[int, int]:
+    """Return a non-leaky Reddit feature window around an earnings event.
+
+    We include the day before the earnings date and the earnings date itself,
+    but exclude the following calendar day so sentiment features cannot absorb
+    obviously post-event discussion.
+    """
+
+    normalized_event_date = _normalize_date(event_date)
+    window_start = _to_unix_timestamp(normalized_event_date) - 86400
+    window_end = _to_unix_timestamp(normalized_event_date + timedelta(days=1)) - 1
+    return window_start, window_end
+
+
 def _fetch_price_history(ticker: str, earnings_date: pd.Timestamp) -> pd.DataFrame:
     """Fetch OHLCV history around an earnings date using yfinance."""
 
@@ -251,18 +265,33 @@ def _load_financial_features(
         }
 
     row = financials.loc[mask].iloc[0]
-    sue_value = _safe_float(row.get("sue", math.nan), default=math.nan)
     earnings_surprise = _safe_float(row.get("earnings_surprise", math.nan), default=math.nan)
     std_dev_surprise = _safe_float(row.get("std_dev_surprise", 0.0))
     momentum = _safe_float(row.get("momentum", math.nan), default=math.nan)
     implied_vol = _safe_float(row.get("implied_vol", DEFAULT_IMPLIED_VOL))
 
-    if not math.isnan(sue_value):
-        sue = sue_value
-    elif std_dev_surprise == 0.0 or math.isnan(earnings_surprise):
-        sue = 0.0
-    else:
+    prior_mask = (
+        (financials["ticker"] == ticker.upper())
+        & (financials["date"] < earnings_date)
+    )
+    prior_surprises = (
+        pd.to_numeric(
+            financials.loc[prior_mask, "earnings_surprise"],
+            errors="coerce",
+        )
+        .dropna()
+        .tolist()
+    )
+    if not math.isnan(earnings_surprise) and len(prior_surprises) >= 2:
+        prior_std = float(pd.Series(prior_surprises, dtype="float64").std(ddof=1))
+        if not math.isnan(prior_std) and prior_std > 0.0:
+            sue = earnings_surprise / prior_std
+        else:
+            sue = 0.0
+    elif std_dev_surprise > 0.0 and not math.isnan(earnings_surprise):
         sue = earnings_surprise / std_dev_surprise
+    else:
+        sue = 0.0
 
     if math.isnan(momentum):
         momentum = 0.0
@@ -296,12 +325,10 @@ def _reddit_json(url: str) -> dict[str, Any]:
 
 
 def fetch_reddit_posts(ticker: str, date: str | pd.Timestamp) -> list[str]:
-    """Fetch Reddit posts mentioning a ticker within plus or minus one day."""
+    """Fetch Reddit posts from the day before through the earnings date only."""
 
     event_date = _normalize_date(date)
-    event_timestamp = _to_unix_timestamp(event_date)
-    lower_bound = event_timestamp - 86400
-    upper_bound = event_timestamp + 86400
+    lower_bound, upper_bound = _reddit_window_bounds(event_date)
     url = (
         f"https://www.reddit.com/search.json?q={ticker}&sort=new&limit=100&type=link"
     )

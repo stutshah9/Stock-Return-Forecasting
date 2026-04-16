@@ -27,7 +27,13 @@ def _load_encoder_config() -> dict[str, Any]:
 
 _ENCODER_CONFIG = _load_encoder_config()
 _DEFAULT_EMBED_DIM = int(_ENCODER_CONFIG.get("model", {}).get("embed_dim", 64))
-_DEFAULT_CHUNK_SIZE = int(_ENCODER_CONFIG.get("data", {}).get("chunk_size", 256))
+_DEFAULT_MIN_CHUNK_SIZE = int(_ENCODER_CONFIG.get("data", {}).get("min_chunk_size", 256))
+_DEFAULT_CHUNK_SIZE = int(
+    _ENCODER_CONFIG.get("data", {}).get(
+        "max_chunk_size",
+        max(int(_ENCODER_CONFIG.get("data", {}).get("chunk_size", 256)), 512),
+    )
+)
 _DEFAULT_MAX_CHUNKS = int(_ENCODER_CONFIG.get("data", {}).get("max_chunks", 16))
 
 
@@ -39,7 +45,9 @@ class TranscriptEncoder(nn.Module):
         embed_dim: int = _DEFAULT_EMBED_DIM,
         frozen: bool = True,
         cache_dir: str | Path | None = None,
+        min_chunk_size: int = _DEFAULT_MIN_CHUNK_SIZE,
         chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        unfrozen_backbone_layers: int = 0,
         max_chunks: int = _DEFAULT_MAX_CHUNKS,
     ) -> None:
         """Initialize the transcript encoder.
@@ -48,14 +56,20 @@ class TranscriptEncoder(nn.Module):
             embed_dim: Output embedding size for the projected transcript vector.
             frozen: Whether to freeze the FinBERT backbone parameters.
             cache_dir: Optional directory for cached transcript chunk embeddings.
-            chunk_size: Number of tokenizer tokens per transcript chunk.
+            min_chunk_size: Minimum number of tokenizer tokens per transcript chunk.
+            chunk_size: Maximum number of tokenizer tokens per transcript chunk.
+            unfrozen_backbone_layers: Number of final backbone encoder layers to
+                unfreeze for optional adaptation. ``0`` keeps the frozen-encoder
+                baseline fully frozen.
             max_chunks: Maximum number of chunks to encode per transcript.
         """
 
         super().__init__()
         self.embed_dim = embed_dim
         self.frozen = frozen
-        self.chunk_size = chunk_size
+        self.min_chunk_size = max(int(min_chunk_size), 1)
+        self.chunk_size = max(int(chunk_size), self.min_chunk_size)
+        self.unfrozen_backbone_layers = max(int(unfrozen_backbone_layers), 0)
         self.chunk_overlap = 32
         self.max_chunks = max_chunks
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
@@ -64,17 +78,32 @@ class TranscriptEncoder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         self.backbone = AutoModel.from_pretrained("ProsusAI/finbert")
         self.projection = nn.Linear(self.backbone.config.hidden_size, embed_dim)
+        self.backbone_max_length = int(
+            getattr(self.backbone.config, "max_position_embeddings", 512)
+        )
+        # We chunk long transcripts manually before they ever reach FinBERT, so
+        # the tokenizer's built-in length warning for whole-document tokenization
+        # is misleading here. Keep the backbone limit separately and only enforce
+        # it when building chunk batches.
+        self.tokenizer.model_max_length = 10**9
 
         if self.frozen:
-            for parameter in self.backbone.parameters():  # was: self.parameters()
+            for parameter in self.backbone.parameters():
                 parameter.requires_grad = False
 
-            # Unfreeze last 2 encoder layers for domain adaptation
-            for name, param in self.backbone.named_parameters():  # was: self.bert.named_parameters()
-                if "encoder.layer.11" in name or "encoder.layer.10" in name:
-                    param.requires_grad = True
+            if self.unfrozen_backbone_layers > 0:
+                layer_prefixes = [
+                    f"encoder.layer.{layer_index}"
+                    for layer_index in range(
+                        12 - self.unfrozen_backbone_layers,
+                        12,
+                    )
+                ]
+                for name, param in self.backbone.named_parameters():
+                    if any(prefix in name for prefix in layer_prefixes):
+                        param.requires_grad = True
 
-            if not any(param.requires_grad for param in self.backbone.parameters()):  # was: self.bert.parameters()
+            if not any(param.requires_grad for param in self.backbone.parameters()):
                 self.backbone.eval()
 
         if self.cache_dir is not None:
@@ -117,22 +146,44 @@ class TranscriptEncoder(nn.Module):
         return self.cache_dir / f"{safe_key}.pt"
 
     def _chunk_token_ids(self, token_ids: list[int]) -> list[list[int]]:
-        """Split token ids into overlapping sliding-window chunks."""
+        """Split token ids into overlapping sliding-window chunks.
+
+        The proposal specifies 256-512 token transcript segments. We therefore
+        treat ``self.chunk_size`` as the maximum segment length and shift the
+        final window forward when needed so trailing segments stay within the
+        configured ``min_chunk_size``/``chunk_size`` range whenever possible.
+        """
 
         if not token_ids:
             return [[]]
 
         step = max(self.chunk_size - self.chunk_overlap, 1)
-        chunks: list[list[int]] = []
-        for start_index in range(0, len(token_ids), step):
-            chunk = token_ids[start_index : start_index + self.chunk_size]
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if len(chunks) >= self.max_chunks:
+        start_indices: list[int] = []
+        start_index = 0
+
+        while start_index < len(token_ids):
+            start_indices.append(start_index)
+            if len(start_indices) >= self.max_chunks:
                 break
             if start_index + self.chunk_size >= len(token_ids):
                 break
+            start_index += step
+
+        if len(start_indices) >= 2:
+            last_start = start_indices[-1]
+            last_length = len(token_ids) - last_start
+            if last_length < self.min_chunk_size:
+                adjusted_start = max(
+                    start_indices[-2] + 1,
+                    len(token_ids) - self.min_chunk_size,
+                )
+                start_indices[-1] = min(adjusted_start, len(token_ids) - 1)
+
+        chunks: list[list[int]] = []
+        for start_index in start_indices:
+            chunk = token_ids[start_index : start_index + self.chunk_size]
+            if chunk:
+                chunks.append(chunk)
         return chunks
 
     def _prepare_chunk_batch(self, chunk_token_ids: list[list[int]]) -> dict[str, Tensor]:
@@ -140,9 +191,10 @@ class TranscriptEncoder(nn.Module):
 
         encoded_chunks = [
             self.tokenizer.prepare_for_model(
-                token_ids,
+                token_ids[: self.backbone_max_length - 2],
                 add_special_tokens=True,
                 truncation=True,
+                max_length=self.backbone_max_length,
                 return_attention_mask=True,
             )
             for token_ids in chunk_token_ids
@@ -150,6 +202,11 @@ class TranscriptEncoder(nn.Module):
         batch = self.tokenizer.pad(encoded_chunks, return_tensors="pt")
         device = self.projection.weight.device
         return {name: tensor.to(device) for name, tensor in batch.items()}
+
+    def _tokenize_transcript(self, text: str) -> list[int]:
+        """Tokenize a raw transcript without emitting whole-document length warnings."""
+
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
     def _mean_pool(self, hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
         """Mean-pool token embeddings with an attention mask."""
@@ -189,7 +246,7 @@ class TranscriptEncoder(nn.Module):
     def _compute_chunk_embeddings(self, text: str) -> Tensor:
         """Encode one transcript into a tensor of chunk embeddings."""
 
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        token_ids = self._tokenize_transcript(text)
         chunk_token_ids = self._chunk_token_ids(token_ids)
         model_inputs = self._prepare_chunk_batch(chunk_token_ids)
 

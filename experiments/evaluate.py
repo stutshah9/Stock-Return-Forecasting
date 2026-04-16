@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -149,6 +150,30 @@ def _split_events_by_year(
     return train_events, cal_events, test_events
 
 
+def _assert_disjoint_splits(
+    train_events: list[dict[str, Any]],
+    cal_events: list[dict[str, Any]],
+    test_events: list[dict[str, Any]],
+) -> None:
+    """Ensure train/calibration/test events are strictly disjoint."""
+
+    def _keys(events: list[dict[str, Any]]) -> set[tuple[str, str]]:
+        return {
+            (str(event.get("ticker", "")).upper(), str(event.get("date", "")))
+            for event in events
+        }
+
+    train_keys = _keys(train_events)
+    cal_keys = _keys(cal_events)
+    test_keys = _keys(test_events)
+    if train_keys & cal_keys:
+        raise ValueError("Training and calibration splits overlap.")
+    if train_keys & test_keys:
+        raise ValueError("Training and test splits overlap.")
+    if cal_keys & test_keys:
+        raise ValueError("Calibration and test splits overlap.")
+
+
 def _feature_triplet(event: dict[str, Any]) -> list[float]:
     """Extract a three-value financial feature list from a cached event."""
 
@@ -200,6 +225,17 @@ def _event_sue(event: dict[str, Any]) -> float:
     if isinstance(raw_features, (list, tuple)) and raw_features:
         return float(raw_features[0])
     return float(_feature_triplet(event)[0])
+
+
+def _event_implied_vol(event: dict[str, Any]) -> float:
+    """Extract the cached implied-volatility feature used for regime assignment."""
+
+    raw_features = event.get("raw_features")
+    if isinstance(raw_features, torch.Tensor):
+        return float(raw_features.detach().cpu().view(-1)[2].item())
+    if isinstance(raw_features, (list, tuple)) and len(raw_features) >= 3:
+        return float(raw_features[2])
+    return float(_feature_triplet(event)[2])
 
 
 def _to_float(value: Any) -> float:
@@ -261,39 +297,49 @@ def _fallback_threshold(
 
 def _prepare_modal_inputs(
     events: list[dict[str, Any]],
+    dataset: EarningsDataset,
     method: str,
     device: torch.device,
 ) -> tuple[list[str], Tensor, Tensor, Tensor, list[str], list[str]]:
     """Prepare modality inputs and metadata for a given evaluation method."""
 
-    transcripts = [str(event.get("transcript", "")) for event in events]
+    def _normalized_zero_financial_tensor() -> torch.Tensor:
+        zero_raw = torch.zeros((len(dataset), 3), dtype=torch.float32, device=device)
+        if not dataset.stats:
+            return zero_raw
+        mean = torch.tensor(dataset.stats["mean"], dtype=torch.float32, device=device)
+        std = torch.tensor(dataset.stats["std"], dtype=torch.float32, device=device)
+        return (zero_raw - mean) / std
+
+    samples = [dataset[index] for index in range(len(dataset))]
+    transcripts = [str(sample.get("transcript", "")) for sample in samples]
     tickers = [str(event.get("ticker", "")) for event in events]
-    regimes = [assign_regime(_event_sue(event)) for event in events]
-    labels = torch.tensor(
-        [float(event.get("label", 0.0)) for event in events],
-        dtype=torch.float32,
-        device=device,
-    )
-    financial = torch.tensor(
-        [_feature_triplet(event) for event in events],
-        dtype=torch.float32,
-        device=device,
-    )
-    sentiment = torch.tensor(
-        [_sentiment_pair(event) for event in events],
-        dtype=torch.float32,
-        device=device,
-    )
+    regimes = [
+        assign_regime(
+            sue=_event_sue(event),
+            implied_vol=_event_implied_vol(event),
+        )
+        for event in events
+    ]
+    labels = torch.stack([sample["label"].float() for sample in samples], dim=0).to(device)
+    financial = torch.stack([sample["features"].float() for sample in samples], dim=0).to(device)
+    sentiment = torch.stack([sample["sentiment"].float() for sample in samples], dim=0).to(device)
 
     if method == "text_only":
-        financial = torch.zeros_like(financial)
+        financial = _normalized_zero_financial_tensor()
         sentiment = torch.zeros_like(sentiment)
     elif method == "financial_only":
         transcripts = ["" for _ in transcripts]
         sentiment = torch.zeros_like(sentiment)
     elif method == "sentiment_only":
         transcripts = ["" for _ in transcripts]
-        financial = torch.zeros_like(financial)
+        financial = _normalized_zero_financial_tensor()
+        if os.environ.get("DEBUG_SENTIMENT_ONLY_TRANSCRIPTS") == "1":
+            print("sentiment_only transcripts first5:", [repr(value) for value in transcripts[:5]])
+            print(
+                "sentiment_only transcripts all_empty:",
+                all(value == "" for value in transcripts),
+            )
 
     return transcripts, financial, sentiment, labels, regimes, tickers
 
@@ -301,6 +347,7 @@ def _prepare_modal_inputs(
 def _compute_model_outputs(
     model: MultimodalForecastModel,
     events: list[dict[str, Any]],
+    dataset: EarningsDataset,
     method: str,
     device: torch.device,
 ) -> tuple[list[dict[str, float]], list[float], list[str], list[str]]:
@@ -308,6 +355,7 @@ def _compute_model_outputs(
 
     transcripts, financial, sentiment, labels, regimes, tickers = _prepare_modal_inputs(
         events,
+        dataset,
         method,
         device,
     )
@@ -378,7 +426,12 @@ def _compute_same_ticker_baseline(
             }
         )
         labels.append(float(event.get("label", 0.0)))
-        regimes.append(assign_regime(_event_sue(event)))
+        regimes.append(
+            assign_regime(
+                sue=_event_sue(event),
+                implied_vol=_event_implied_vol(event),
+            )
+        )
         tickers.append(ticker)
     return outputs, labels, regimes, tickers
 
@@ -412,6 +465,17 @@ def _predict_interval_naive(
     sigma = math.exp(_to_float(output["log_sigma"]))
     half_width = global_thresholds[float(coverage)] * sigma
     return mu - half_width, mu + half_width
+
+
+def _regime_components(regime: str) -> tuple[str, str]:
+    """Split a composite regime into surprise and volatility subgroup labels."""
+
+    normalized_regime = str(regime)
+    if normalized_regime.endswith("_low_vol"):
+        return normalized_regime[: -len("_low_vol")], "low_vol"
+    if normalized_regime.endswith("_high_vol"):
+        return normalized_regime[: -len("_high_vol")], "high_vol"
+    return normalized_regime, "unknown_vol"
 
 
 def _metric_row(
@@ -503,6 +567,44 @@ def _metric_row(
     }
 
 
+def _subgroup_metric_rows(
+    method: str,
+    outputs: list[dict[str, float]],
+    labels: list[float],
+    regimes: list[str],
+    predictor: EventConditionedConformalPredictor,
+    global_thresholds: dict[float, float],
+    mode: str,
+) -> list[dict[str, float | str | int]]:
+    """Compute subgroup metrics by surprise band and volatility regime."""
+
+    subgroup_members: dict[tuple[str, str], list[int]] = {}
+    for index, regime in enumerate(regimes):
+        surprise_band, volatility_band = _regime_components(regime)
+        subgroup_members.setdefault(("surprise_band", surprise_band), []).append(index)
+        subgroup_members.setdefault(("volatility_band", volatility_band), []).append(index)
+
+    rows: list[dict[str, float | str | int]] = []
+    for (subgroup_type, subgroup_name), indices in sorted(subgroup_members.items()):
+        subgroup_outputs = [outputs[index] for index in indices]
+        subgroup_labels = [labels[index] for index in indices]
+        subgroup_regimes = [regimes[index] for index in indices]
+        row = _metric_row(
+            method=method,
+            outputs=subgroup_outputs,
+            labels=subgroup_labels,
+            regimes=subgroup_regimes,
+            predictor=predictor,
+            global_thresholds=global_thresholds,
+            mode=mode,
+        )
+        row["subgroup_type"] = subgroup_type
+        row["subgroup"] = subgroup_name
+        row["n"] = len(indices)
+        rows.append(row)
+    return rows
+
+
 def evaluate(config_path: str) -> None:
     """Evaluate the trained model, ablations, and conformal baselines.
 
@@ -526,30 +628,37 @@ def evaluate(config_path: str) -> None:
         train_events, cal_events, test_events = _split_events_by_year(all_events)
     except Exception as exc:
         raise ValueError(f"Could not build the requested evaluation split. {exc}") from exc
+    _assert_disjoint_splits(train_events, cal_events, test_events)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
-    cal_samples = [cal_dataset[index] for index in range(len(cal_dataset))]
-    test_samples = [test_dataset[index] for index in range(len(test_dataset))]
 
     device = _select_device(config)
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
-    model_path = PROJECT_ROOT / "experiments" / "model.pt"
+    model_path = PROJECT_ROOT / "experiments" / "model_best.pt" if (PROJECT_ROOT / "experiments" / "model_best.pt").exists() else PROJECT_ROOT / "experiments" / "model.pt"
     if not model_path.is_file():
         model_path = PROJECT_ROOT / "model.pt"
 
     model = MultimodalForecastModel.load_from_config(str(config_file))
     state_dict = torch.load(model_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    load_result = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(getattr(load_result, "missing_keys", []))
+    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+    if missing_keys or unexpected_keys:
+        print(
+            "Warning: loaded checkpoint with partial compatibility. "
+            f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}"
+        )
     model.eval()
     model.to(device)
     _log_device_diagnostics(device, model)
 
     cal_outputs, cal_labels, cal_regimes, _ = _compute_model_outputs(
         model=model,
-        events=cal_samples,
+        events=cal_events,
+        dataset=cal_dataset,
         method="full_multimodal",
         device=device,
     )
@@ -565,6 +674,7 @@ def evaluate(config_path: str) -> None:
     historical_events = train_events + cal_events
 
     results_rows: list[dict[str, float | str]] = []
+    subgroup_rows: list[dict[str, float | str | int]] = []
 
     for method, mode in (
         ("text_only", "regime_no_introspection"),
@@ -577,12 +687,24 @@ def evaluate(config_path: str) -> None:
         base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
         outputs, labels, regimes, _tickers = _compute_model_outputs(
             model=model,
-            events=test_samples,
+            events=test_events,
+            dataset=test_dataset,
             method=base_method,
             device=device,
         )
         results_rows.append(
             _metric_row(
+                method=method,
+                outputs=outputs,
+                labels=labels,
+                regimes=regimes,
+                predictor=predictor,
+                global_thresholds=global_thresholds,
+                mode=mode,
+            )
+        )
+        subgroup_rows.extend(
+            _subgroup_metric_rows(
                 method=method,
                 outputs=outputs,
                 labels=labels,
@@ -608,8 +730,20 @@ def evaluate(config_path: str) -> None:
             mode="naive",
         )
     )
+    subgroup_rows.extend(
+        _subgroup_metric_rows(
+            method="same_ticker_baseline",
+            outputs=baseline_outputs,
+            labels=baseline_labels,
+            regimes=baseline_regimes,
+            predictor=predictor,
+            global_thresholds=global_thresholds,
+            mode="naive",
+        )
+    )
 
     results_table = pd.DataFrame(results_rows)
+    subgroup_results_table = pd.DataFrame(subgroup_rows)
     display_columns = [
         "method",
         "coverage_80",
@@ -621,11 +755,34 @@ def evaluate(config_path: str) -> None:
         "dir_acc",
     ]
     print(tabulate(results_table[display_columns], headers="keys", tablefmt="github", showindex=False))
+    if not subgroup_results_table.empty:
+        subgroup_display_columns = [
+            "method",
+            "subgroup_type",
+            "subgroup",
+            "n",
+            "coverage_80",
+            "coverage_90",
+            "coverage_95",
+            "avg_width",
+        ]
+        print(
+            tabulate(
+                subgroup_results_table[subgroup_display_columns],
+                headers="keys",
+                tablefmt="github",
+                showindex=False,
+            )
+        )
 
     experiments_results_path = PROJECT_ROOT / "experiments" / "results.csv"
     root_results_path = PROJECT_ROOT / "results.csv"
+    experiments_subgroup_results_path = PROJECT_ROOT / "experiments" / "results_by_subgroup.csv"
+    root_subgroup_results_path = PROJECT_ROOT / "results_by_subgroup.csv"
     results_table.to_csv(experiments_results_path, index=False)
     results_table.to_csv(root_results_path, index=False)
+    subgroup_results_table.to_csv(experiments_subgroup_results_path, index=False)
+    subgroup_results_table.to_csv(root_subgroup_results_path, index=False)
 
 
 if __name__ == "__main__":
@@ -634,6 +791,11 @@ if __name__ == "__main__":
         "--config",
         default="config.yaml",
         help="Path to the YAML configuration file.",
+    )
+    parser.add_argument(
+        "--allow-synthetic-fallback",
+        action="store_true",
+        help="Compatibility flag accepted by legacy tests; evaluation remains cache-based.",
     )
     args = parser.parse_args()
 

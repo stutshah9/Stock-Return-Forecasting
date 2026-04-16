@@ -122,6 +122,30 @@ def _split_events_by_year(
     return train_events, cal_events, test_events
 
 
+def _assert_disjoint_splits(
+    train_events: list[dict[str, Any]],
+    cal_events: list[dict[str, Any]],
+    test_events: list[dict[str, Any]],
+) -> None:
+    """Ensure train/calibration/test events are strictly disjoint."""
+
+    def _keys(events: list[dict[str, Any]]) -> set[tuple[str, str]]:
+        return {
+            (str(event.get("ticker", "")).upper(), str(event.get("date", "")))
+            for event in events
+        }
+
+    train_keys = _keys(train_events)
+    cal_keys = _keys(cal_events)
+    test_keys = _keys(test_events)
+    if train_keys & cal_keys:
+        raise ValueError("Training and calibration splits overlap.")
+    if train_keys & test_keys:
+        raise ValueError("Training and test splits overlap.")
+    if cal_keys & test_keys:
+        raise ValueError("Calibration and test splits overlap.")
+
+
 def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate dataset samples into model-ready tensors and metadata."""
 
@@ -129,7 +153,13 @@ def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     financial = torch.stack([item["features"].float() for item in batch], dim=0)
     sentiment = torch.stack([item["sentiment"].float() for item in batch], dim=0)
     labels = torch.stack([item["label"].float() for item in batch], dim=0).view(-1)
-    regimes = [assign_regime(float(item["raw_features"][0].item())) for item in batch]
+    regimes = [
+        assign_regime(
+            sue=float(item["raw_features"][0].item()),
+            implied_vol=float(item["raw_features"][2].item()),
+        )
+        for item in batch
+    ]
     return {
         "transcripts": transcripts,
         "financial": financial,
@@ -301,6 +331,7 @@ def train(config_path: str) -> None:
         train_events, cal_events, test_events = _split_events_by_year(events)
     except Exception as exc:
         raise ValueError(f"Could not build the requested split. {exc}") from exc
+    _assert_disjoint_splits(train_events, cal_events, test_events)
 
     feature_stats = EarningsDataset.compute_feature_stats(train_events)
     FEATURE_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +370,10 @@ def train(config_path: str) -> None:
         weight_decay=1e-4,
     )
 
+    best_cal_loss = float("inf")
+    patience_counter = 0
+    PATIENCE = 5
+
     for epoch_index in range(epochs):
         model.train()
         running_loss = 0.0
@@ -374,6 +409,31 @@ def train(config_path: str) -> None:
 
         epoch_loss = running_loss / batch_count
         tqdm.write(f"Epoch {epoch_index + 1}/{epochs} train_loss={epoch_loss:.4f}")
+
+        model.eval()
+        cal_loss_total = 0.0
+        with torch.no_grad():
+            for batch in cal_loader:
+                batch = _move_batch_to_device(batch, device)
+                out = model(
+                    transcripts=batch["transcripts"],
+                    financial=batch["financial"],
+                    sentiment=batch["sentiment"],
+                )
+                cal_loss_total += model.loss(out, batch["labels"]).item()
+        cal_loss_avg = cal_loss_total / len(cal_loader)
+        print(f"  cal_loss={cal_loss_avg:.4f}")
+        model.train()
+
+        if cal_loss_avg < best_cal_loss:
+            best_cal_loss = cal_loss_avg
+            patience_counter = 0
+            torch.save(model.state_dict(), PROJECT_ROOT / "experiments" / "model_best.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"Early stopping at epoch {epoch_index + 1}")
+                break
 
     cal_outputs, cal_labels, cal_regimes = _run_inference(model, cal_loader, device)
     _run_inference(model, test_loader, device)

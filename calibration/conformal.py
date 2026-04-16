@@ -9,16 +9,21 @@ from typing import Any
 import numpy as np
 
 
-VALID_REGIMES = (
-    "low_surprise",
-    "medium_surprise",
-    "high_surprise",
+SURPRISE_BANDS = ("low_surprise", "medium_surprise", "high_surprise")
+VOLATILITY_BANDS = ("low_vol", "high_vol")
+VALID_REGIMES = tuple(
+    f"{surprise_band}_{volatility_band}"
+    for surprise_band in SURPRISE_BANDS
+    for volatility_band in VOLATILITY_BANDS
 )
 LEGACY_REGIME_MAP = {
     "low": "low_surprise",
     "mid": "medium_surprise",
     "medium": "medium_surprise",
     "high": "high_surprise",
+    "low_surprise": "low_surprise_low_vol",
+    "medium_surprise": "medium_surprise_low_vol",
+    "high_surprise": "high_surprise_high_vol",
 }
 
 
@@ -32,7 +37,7 @@ def _to_float(value: Any) -> float:
 
 
 def _normalize_regime(regime: str) -> str:
-    """Normalize regime labels to the canonical surprise-regime names."""
+    """Normalize regime labels to the canonical surprise/volatility regime names."""
 
     normalized_regime = LEGACY_REGIME_MAP.get(regime, regime)
     if normalized_regime not in VALID_REGIMES:
@@ -55,27 +60,37 @@ def _conformal_quantile(scores: list[float], quantile_level: float) -> float:
 
 def assign_regime(
     sue: float,
+    implied_vol: float = 0.0,
     low_thresh: float = 0.5,
     high_thresh: float = 1.5,
+    vol_thresh: float = 0.30,
 ) -> str:
-    """Assign an event to a surprise regime based on the magnitude of SUE.
+    """Assign an event to a conformal regime using surprise and volatility.
 
     Args:
         sue: Standardized unexpected earnings value.
         low_thresh: Magnitude threshold below which an event is low surprise.
         high_thresh: Magnitude threshold above which an event is high surprise.
+        implied_vol: Pre-event implied or realized volatility proxy.
+        vol_thresh: Threshold separating low- and high-volatility events.
 
     Returns:
-        One of ``"low_surprise"``, ``"medium_surprise"``, or
-        ``"high_surprise"``.
+        One of the composite regime labels in ``VALID_REGIMES``.
     """
 
     absolute_sue = abs(float(sue))
     if absolute_sue < low_thresh:
-        return "low_surprise"
-    if absolute_sue < high_thresh:
-        return "medium_surprise"
-    return "high_surprise"
+        surprise_band = "low_surprise"
+    elif absolute_sue < high_thresh:
+        surprise_band = "medium_surprise"
+    else:
+        surprise_band = "high_surprise"
+
+    try:
+        volatility_band = "high_vol" if float(implied_vol) >= vol_thresh else "low_vol"
+    except Exception:
+        volatility_band = "low_vol"
+    return f"{surprise_band}_{volatility_band}"
 
 
 class EventConditionedConformalPredictor:
@@ -104,7 +119,7 @@ class EventConditionedConformalPredictor:
             cal_outputs: Model outputs containing ``mu``, ``log_sigma``, and
                 ``introspective_score``.
             cal_labels: Ground-truth calibration labels.
-            cal_regimes: Surprise-regime label for each calibration sample.
+            cal_regimes: Event-regime label for each calibration sample.
             **legacy_kwargs: Compatibility aliases such as ``outputs`` or
                 ``regimes`` from older call sites.
         """
@@ -150,7 +165,7 @@ class EventConditionedConformalPredictor:
         Args:
             output: Model output dictionary with ``mu``, ``log_sigma``, and
                 ``introspective_score`` entries.
-            regime: Surprise regime for the event.
+            regime: Event regime for the example.
             coverage: Desired calibrated coverage level.
 
         Returns:
@@ -187,7 +202,7 @@ class EventConditionedConformalPredictor:
 
         Args:
             output: Model output dictionary.
-            regime: Surprise regime for the event.
+            regime: Event regime for the example.
             coverage: Desired calibrated coverage level.
             min_score: Minimum acceptable introspective confidence.
 
@@ -227,6 +242,7 @@ if __name__ == "__main__":
         score = random.uniform(0.1, 0.95)
         label = mu + random.gauss(0.0, math.exp(log_sigma))
         sue = random.uniform(-2.5, 2.5)
+        implied_vol = random.uniform(0.1, 0.6)
 
         calibration_outputs.append(
             {
@@ -236,7 +252,7 @@ if __name__ == "__main__":
             }
         )
         calibration_labels.append(label)
-        calibration_regimes.append(assign_regime(sue))
+        calibration_regimes.append(assign_regime(sue=sue, implied_vol=implied_vol))
 
     predictor.calibrate(
         cal_outputs=calibration_outputs,
@@ -249,7 +265,7 @@ if __name__ == "__main__":
         "log_sigma": -0.2,
         "introspective_score": 0.72,
     }
-    sample_regime = "medium_surprise"
+    sample_regime = "medium_surprise_low_vol"
     interval = predictor.predict_interval(sample_output, regime=sample_regime)
     decision = predictor.selective_predict(sample_output, regime=sample_regime)
 

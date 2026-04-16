@@ -44,8 +44,8 @@ The pipeline is split into:
 
 Current split behavior in code:
 
-- train years: `<= 2023`
-- calibration year: `2024`
+- train years: `<= 2022`
+- calibration years: `2023` and `2024`
 - test year: `2025`
 
 Note: while `config.yaml` contains a `data.split` block, current train/evaluate
@@ -162,9 +162,9 @@ What happens:
 
 - cached events are loaded from `data/events_cache.pt`
 - events are filtered to the configured universe, currently `sp500`
-- events are split with current fixed code logic: train `<= 2023`, calibration `2024`, test `2025`
+- events are split with current fixed code logic: train `<= 2022`, calibration `2023-2024`, test `2025`
 - only the training split is used for gradient updates
-- the calibration split is never used during training
+- the calibration split is used for loss-based early stopping and then reused later for conformal calibration during evaluation
 - model weights are saved to `experiments/model.pt`
 - calibration outputs are saved to `data/cal_outputs.pt`
 
@@ -210,6 +210,12 @@ The script prints a results table with:
 - `RMSE`
 - `dir_acc`
 
+It also saves subgroup-stratified metrics by surprise band and volatility regime to:
+
+```text
+experiments/results_by_subgroup.csv
+```
+
 And saves the CSV to:
 
 ```text
@@ -248,6 +254,94 @@ training:
 
 That is the standard "train on training data, calibrate on calibration data, test on held-out data" workflow for this repo.
 
+## VT ARC
+
+For VT ARC, the simplest path is:
+
+1. Log in to ARC and load a Python module that includes `python3` and `pip`.
+2. Create a virtual environment in your project or home directory.
+3. Install the repo requirements.
+4. Build the event cache on a CPU node if needed.
+5. Train on a GPU node with `training.device: cuda`.
+6. Evaluate from the saved checkpoint on a GPU or CPU node.
+
+Example setup on an ARC login node:
+
+```bash
+cd $HOME
+git clone <your-repo-url> Stock-Return-Forecasting
+cd Stock-Return-Forecasting
+
+module avail python
+module load python
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+If `pip install -r requirements.txt` fails on the `AutoModel` line, remove that line from the requirements file or install the listed packages individually. `AutoModel` is imported from `transformers`; it is not a separate package.
+
+Build the cache before training:
+
+```bash
+python3 data/build_cache.py
+```
+
+Then train with a Slurm batch script such as:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=earnings-train
+#SBATCH --account=<your_account>
+#SBATCH --partition=<gpu_partition>
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=08:00:00
+#SBATCH --output=logs/%x-%j.out
+
+cd $HOME/Stock-Return-Forecasting
+source .venv/bin/activate
+
+python3 experiments/train.py
+```
+
+And evaluate with:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=earnings-eval
+#SBATCH --account=<your_account>
+#SBATCH --partition=<gpu_partition>
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/%x-%j.out
+
+cd $HOME/Stock-Return-Forecasting
+source .venv/bin/activate
+
+python3 experiments/evaluate.py
+```
+
+Submit and monitor jobs with:
+
+```bash
+mkdir -p logs
+sbatch train.slurm
+sbatch eval.slurm
+squeue -u $USER
+```
+
+If you want a quick local sanity check on ARC before the full run:
+
+```bash
+python3 experiments/train.py --dry-run
+```
+
 ## Run All Checks
 
 To run every phase test script:
@@ -276,12 +370,12 @@ done
 rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
 
 # run on ARC
-- ssh stutishah9@falcon2.arc.vt.edu
-- srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:l40s:1      --pty bash -l
-- source .venv/bin/activate
-- cd earnings_forecast/
-- python3 experiments/train.py
-- python3 experiments/evaluate.py
+ssh stutishah9@falcon2.arc.vt.edu
+srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=02:00:00      --gres=gpu:l40s:1      --pty bash -l
+source .venv/bin/activate
+cd earnings_forecast/
+python3 experiments/train.py
+python3 experiments/evaluate.py
 
 # pull data from ARC
 rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ /Users/Stuti/Stock-Return-Forecasting/

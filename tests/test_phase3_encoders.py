@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import warnings
 
 import torch
 import yaml
@@ -31,8 +32,20 @@ def main() -> None:
     assert not torch.isnan(transcript_out).any().item(), "Transcript output contains NaN"
 
     frozen_encoder = TranscriptEncoder(embed_dim=embed_dim, frozen=True)
-    for param in frozen_encoder.parameters():
-        assert not param.requires_grad, "Frozen transcript encoder params must be non-trainable"
+    for param in frozen_encoder.backbone.parameters():
+        assert not param.requires_grad, "Frozen transcript backbone params must be non-trainable"
+    assert any(
+        param.requires_grad for param in frozen_encoder.projection.parameters()
+    ), "Transcript projection should remain trainable for the fixed-embedding baseline"
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        token_ids = frozen_encoder._tokenize_transcript("hello " * 2000)
+    assert len(token_ids) > 512, "Long transcript tokenization regression test is malformed"
+    assert not any(
+        "Token indices sequence length is longer than the specified maximum sequence length"
+        in str(warning.message)
+        for warning in captured_warnings
+    ), "Long transcript preprocessing should not emit a misleading max-length warning"
 
     # FinancialEncoder tests
     financial_encoder = FinancialEncoder(embed_dim=embed_dim)
