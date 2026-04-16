@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 import sys
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 import yaml
 
@@ -20,6 +22,69 @@ except ImportError:
     from encoders.financial_encoder import FinancialEncoder
     from encoders.sentiment_encoder import SentimentEncoder
     from encoders.text_encoder import TranscriptEncoder
+
+
+class CrossModalFusionLayer(nn.Module):
+    """Symmetric three-way cross-attention over text, financial, and sentiment tokens."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.attentions = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    embed_dim,
+                    num_heads=num_heads,
+                    batch_first=True,
+                    dropout=dropout,
+                )
+                for _ in range(3)
+            ]
+        )
+        self.pre_norms = nn.ModuleList([nn.LayerNorm(embed_dim) for _ in range(3)])
+        self.post_norms = nn.ModuleList([nn.LayerNorm(embed_dim) for _ in range(3)])
+        self.feedforwards = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(embed_dim * 2, embed_dim),
+                )
+                for _ in range(3)
+            ]
+        )
+
+    def forward(self, tokens: Tensor) -> tuple[Tensor, list[Tensor]]:
+        """Cross-attend each modality token to the other two modalities."""
+
+        updated_tokens: list[Tensor] = []
+        attention_maps: list[Tensor] = []
+
+        for modality_index in range(tokens.size(1)):
+            query = tokens[:, modality_index : modality_index + 1, :]
+            other_indices = [
+                index for index in range(tokens.size(1)) if index != modality_index
+            ]
+            context = tokens[:, other_indices, :]
+            attn_output, attn_weights = self.attentions[modality_index](
+                query=query,
+                key=context,
+                value=context,
+                need_weights=True,
+                average_attn_weights=False,
+            )
+            residual = self.pre_norms[modality_index](query + attn_output)
+            ffn_output = self.feedforwards[modality_index](residual)
+            updated = self.post_norms[modality_index](residual + ffn_output)
+            updated_tokens.append(updated)
+            attention_maps.append(attn_weights.mean(dim=1).squeeze(1))
+
+        return torch.cat(updated_tokens, dim=1), attention_maps
 
 
 class MultimodalForecastModel(nn.Module):
@@ -42,15 +107,27 @@ class MultimodalForecastModel(nn.Module):
         self.dropout = float(model_config.get("dropout", 0.1))
         self.text_frozen = bool(model_config.get("text_frozen", True))
         self.cache_dir = data_config.get("cache_dir")
+        self.num_attention_heads = 4
+        self.num_fusion_layers = int(model_config.get("fusion_layers", 2))
 
-        if self.embed_dim % 4 != 0:
-            raise ValueError("embed_dim must be divisible by 4 for 4-head attention.")
+        if self.embed_dim % self.num_attention_heads != 0:
+            raise ValueError(
+                f"embed_dim must be divisible by {self.num_attention_heads} "
+                "for multimodal attention."
+            )
 
         self.transcript_encoder = TranscriptEncoder(
             embed_dim=self.embed_dim,
             frozen=self.text_frozen,
             cache_dir=self.cache_dir,
-            chunk_size=int(data_config.get("chunk_size", 256)),
+            min_chunk_size=int(data_config.get("min_chunk_size", 256)),
+            chunk_size=int(
+                data_config.get(
+                    "max_chunk_size",
+                    max(int(data_config.get("chunk_size", 256)), 512),
+                )
+            ),
+            unfrozen_backbone_layers=int(model_config.get("text_unfrozen_layers", 0)),
             max_chunks=int(data_config.get("max_chunks", 16)),
         )
         self.financial_encoder = FinancialEncoder(
@@ -64,21 +141,24 @@ class MultimodalForecastModel(nn.Module):
             dropout=self.dropout,
         )
 
-        self.cross_attention = nn.MultiheadAttention(
-            self.embed_dim,
-            num_heads=4,
-            batch_first=True,
+        self.fusion_layers = nn.ModuleList(
+            [
+                CrossModalFusionLayer(
+                    embed_dim=self.embed_dim,
+                    num_heads=self.num_attention_heads,
+                    dropout=self.dropout,
+                )
+                for _ in range(self.num_fusion_layers)
+            ]
         )
+        self.fusion_norm = nn.LayerNorm(self.embed_dim)
         self.gaussian_head = nn.Linear(self.embed_dim, 2)
         self.explanation_head = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.ReLU(),
             nn.Linear(self.embed_dim, 32),
         )
-        self.introspective_head = nn.Sequential(
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
-        )
+        self._loss_debug_printed = False
 
     @classmethod
     def load_from_config(cls, config_path: str) -> MultimodalForecastModel:
@@ -101,7 +181,8 @@ class MultimodalForecastModel(nn.Module):
         financial: Tensor | None = None,
         sentiment: Tensor | None = None,
         transcripts: list[str] | None = None,
-    ) -> dict[str, Tensor]:
+        return_explanations: bool = False,
+    ) -> dict[str, Any]:
         """Run a forward pass through the multimodal fusion model.
 
         Args:
@@ -109,10 +190,12 @@ class MultimodalForecastModel(nn.Module):
             financial: Structured financial inputs with shape ``[B, 3]``.
             sentiment: Aggregated sentiment inputs with shape ``[B, 2]``.
             transcripts: Alias for ``transcript`` for compatibility with callers.
+            return_explanations: Whether to include lightweight natural-language
+                explanation strings in the returned dictionary.
 
         Returns:
-            A dictionary with Gaussian parameters, explanation features, and an
-            introspective explanation-confidence score.
+            A dictionary with Gaussian parameters, attention-derived confidence,
+            explanation features, and optional natural-language explanations.
         """
 
         transcript_inputs = transcripts if transcripts is not None else transcript
@@ -131,48 +214,137 @@ class MultimodalForecastModel(nn.Module):
         financial_emb = self.financial_encoder(financial)
         sentiment_emb = self.sentiment_encoder(sentiment)
 
-        query = transcript_emb.unsqueeze(1)
-        key_value = torch.stack((financial_emb, sentiment_emb), dim=1)
-        attended_output, _ = self.cross_attention(query, key_value, key_value)
-        fused_embedding = attended_output.squeeze(1)
+        modality_tokens = torch.stack(
+            (transcript_emb, financial_emb, sentiment_emb),
+            dim=1,
+        )
+        attention_history: list[list[Tensor]] = []
+        for fusion_layer in self.fusion_layers:
+            modality_tokens, layer_attention = fusion_layer(modality_tokens)
+            attention_history.append(layer_attention)
+        fused_embedding = self.fusion_norm(modality_tokens.mean(dim=1))
 
         gaussian_params = self.gaussian_head(fused_embedding)
         mu = gaussian_params[:, 0]
-        log_sigma = torch.clamp(gaussian_params[:, 1], min=-3.0, max=3.0)
+        log_variance = torch.clamp(gaussian_params[:, 1], min=-6.0, max=6.0)
+        variance = torch.exp(log_variance)
+        log_sigma = 0.5 * log_variance
 
         explanation_vec = self.explanation_head(fused_embedding)
-        introspective_score = self.introspective_head(explanation_vec).squeeze(-1)
+        introspective_score = self._attention_stability_score(attention_history)
 
-        return {
+        outputs: dict[str, Any] = {
             "mu": mu,
             "log_sigma": log_sigma,
+            "log_variance": log_variance,
+            "variance": variance,
             "explanation_vec": explanation_vec,
             "introspective_score": introspective_score,
+            "attention_weights": tuple(
+                torch.stack(layer_attention, dim=1)
+                for layer_attention in attention_history
+            ),
         }
+        if return_explanations:
+            outputs["explanations"] = self._build_explanations(
+                mu=mu,
+                variance=variance,
+                modality_tokens=modality_tokens,
+            )
+        return outputs
 
-    def loss(self, output: dict[str, Tensor], y: Tensor) -> Tensor:
-        """Compute the Gaussian negative log-likelihood loss.
+    def _attention_stability_score(self, attention_history: list[list[Tensor]]) -> Tensor:
+        """Derive an introspective confidence score from layer-to-layer stability."""
+
+        if not attention_history:
+            raise ValueError("attention_history must contain at least one fusion layer.")
+
+        if len(attention_history) == 1:
+            batch_size = attention_history[0][0].shape[0]
+            device = attention_history[0][0].device
+            return torch.ones(batch_size, device=device)
+
+        stacked_history = [
+            torch.stack(layer_attention, dim=1)
+            for layer_attention in attention_history
+        ]
+        layer_differences = [
+            (current_layer - previous_layer).abs().mean(dim=(1, 2))
+            for previous_layer, current_layer in zip(
+                stacked_history,
+                stacked_history[1:],
+            )
+        ]
+        mean_difference = torch.stack(layer_differences, dim=0).mean(dim=0)
+        return torch.clamp(1.0 - mean_difference, min=0.0, max=1.0)
+
+    def _build_explanations(
+        self,
+        mu: Tensor,
+        variance: Tensor,
+        modality_tokens: Tensor,
+    ) -> list[str]:
+        """Generate lightweight natural-language forecast explanations."""
+
+        modality_names = ("transcript", "financial", "sentiment")
+        modality_strength = modality_tokens.norm(dim=-1)
+        explanations: list[str] = []
+
+        for index in range(mu.shape[0]):
+            dominant_index = int(modality_strength[index].argmax().item())
+            direction = "positive" if float(mu[index].item()) >= 0.0 else "negative"
+            uncertainty = "elevated" if float(variance[index].item()) > 1.0 else "moderate"
+            explanations.append(
+                "The model forecasts a "
+                f"{direction} next-day return with {uncertainty} uncertainty, "
+                f"driven most strongly by the {modality_names[dominant_index]} modality "
+                "after cross-modal interaction."
+            )
+
+        return explanations
+
+    def loss(self, output: dict[str, Any], y: Tensor) -> Tensor:
+        """Compute the Gaussian negative log-likelihood plus directional loss.
 
         Args:
             output: Model outputs from ``forward``.
             y: Ground-truth returns with shape ``[B]``.
 
         Returns:
-            A scalar Gaussian negative log-likelihood loss.
+            A scalar combined training loss.
         """
 
         mu = output["mu"]
-        log_sigma = output["log_sigma"]
+        log_variance = output.get("log_variance")
+        if log_variance is None:
+            log_variance = 2.0 * output["log_sigma"]
+        variance = output.get("variance")
+        if variance is None:
+            variance = torch.exp(log_variance)
         targets = y.to(device=mu.device, dtype=torch.float32).view(-1)
 
-        variance = torch.exp(2.0 * log_sigma)
-        squared_error = (targets - mu) ** 2
-        nll = 0.5 * (
-            squared_error / variance + 2.0 * log_sigma + math.log(2.0 * math.pi)
-        )
+        nll_loss = 0.5 * (
+            ((targets - mu) ** 2) / variance
+            + log_variance
+            + math.log(2.0 * math.pi)
+        ).mean()
 
-        # TODO: Add an explanation-alignment or calibration-aware regularizer.
-        return nll.mean()
+        mu_scaled = mu / mu.detach().std().clamp(min=1e-6)
+        dir_prob = torch.sigmoid(mu_scaled * 3.0)
+        dir_target = (targets > 0).float()
+        dir_loss = F.binary_cross_entropy(dir_prob, dir_target)
+
+        total_loss = nll_loss + 0.3 * dir_loss
+
+        if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
+            print(f"dir_loss value: {dir_loss.item():.6f}")
+            print(f"nll_loss value: {nll_loss.item():.6f}")
+            print(f"total loss: {total_loss.item():.6f}")
+            print(f"fraction of mu > 0: {(mu > 0).float().mean().item():.6f}")
+            print(f"fraction of y > 0: {(targets > 0).float().mean().item():.6f}")
+            self._loss_debug_printed = True
+
+        return total_loss
 
 
 if __name__ == "__main__":

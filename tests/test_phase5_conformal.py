@@ -30,9 +30,12 @@ def main() -> None:
     outputs = _sample_outputs(90)
     labels = [random.uniform(-0.10, 0.10) for _ in range(90)]
     regimes = (
-        (["low_surprise"] * 30)
-        + (["medium_surprise"] * 30)
-        + (["high_surprise"] * 30)
+        (["low_surprise_low_vol"] * 15)
+        + (["low_surprise_high_vol"] * 15)
+        + (["medium_surprise_low_vol"] * 15)
+        + (["medium_surprise_high_vol"] * 15)
+        + (["high_surprise_low_vol"] * 15)
+        + (["high_surprise_high_vol"] * 15)
     )
 
     predictor.calibrate(
@@ -42,15 +45,24 @@ def main() -> None:
     )
 
     required_keys = [
-        ("low_surprise", 0.80),
-        ("low_surprise", 0.90),
-        ("low_surprise", 0.95),
-        ("medium_surprise", 0.80),
-        ("medium_surprise", 0.90),
-        ("medium_surprise", 0.95),
-        ("high_surprise", 0.80),
-        ("high_surprise", 0.90),
-        ("high_surprise", 0.95),
+        ("low_surprise_low_vol", 0.80),
+        ("low_surprise_low_vol", 0.90),
+        ("low_surprise_low_vol", 0.95),
+        ("low_surprise_high_vol", 0.80),
+        ("low_surprise_high_vol", 0.90),
+        ("low_surprise_high_vol", 0.95),
+        ("medium_surprise_low_vol", 0.80),
+        ("medium_surprise_low_vol", 0.90),
+        ("medium_surprise_low_vol", 0.95),
+        ("medium_surprise_high_vol", 0.80),
+        ("medium_surprise_high_vol", 0.90),
+        ("medium_surprise_high_vol", 0.95),
+        ("high_surprise_low_vol", 0.80),
+        ("high_surprise_low_vol", 0.90),
+        ("high_surprise_low_vol", 0.95),
+        ("high_surprise_high_vol", 0.80),
+        ("high_surprise_high_vol", 0.90),
+        ("high_surprise_high_vol", 0.95),
     ]
     for key in required_keys:
         assert key in predictor.thresholds, "Missing threshold key"
@@ -61,19 +73,19 @@ def main() -> None:
 
     lo90, hi90 = predictor.predict_interval(
         low_score_out,
-        regime="medium_surprise",
+        regime="medium_surprise_low_vol",
         coverage=0.90,
     )
     assert lo90 < hi90, "Interval bounds must satisfy lo < hi"
 
     lo_low, hi_low = predictor.predict_interval(
         low_score_out,
-        regime="medium_surprise",
+        regime="medium_surprise_low_vol",
         coverage=0.90,
     )
     lo_high, hi_high = predictor.predict_interval(
         high_score_out,
-        regime="medium_surprise",
+        regime="medium_surprise_low_vol",
         coverage=0.90,
     )
     width_low = hi_low - lo_low
@@ -82,7 +94,7 @@ def main() -> None:
 
     lo95, hi95 = predictor.predict_interval(
         high_score_out,
-        regime="medium_surprise",
+        regime="medium_surprise_low_vol",
         coverage=0.95,
     )
     width95 = hi95 - lo95
@@ -91,16 +103,16 @@ def main() -> None:
 
     reject = predictor.selective_predict(
         {"mu": 1e-8, "log_sigma": 2.5, "introspective_score": 0.05},
-        regime="medium_surprise",
+        regime="medium_surprise_low_vol",
         coverage=0.90,
     )
     assert reject is None, "selective_predict should reject uncertain near-zero case"
 
-    assert assign_regime(0.2) == "low_surprise", "assign_regime low boundary failed"
+    assert assign_regime(0.2, 0.20) == "low_surprise_low_vol", "assign_regime low/low failed"
     assert (
-        assign_regime(1.0) == "medium_surprise"
-    ), "assign_regime medium boundary failed"
-    assert assign_regime(-2.0) == "high_surprise", "assign_regime high boundary failed"
+        assign_regime(1.0, 0.35) == "medium_surprise_high_vol"
+    ), "assign_regime medium/high failed"
+    assert assign_regime(-2.0, 0.10) == "high_surprise_low_vol", "assign_regime high/low failed"
 
     print("All conformal tests passed.")
 
