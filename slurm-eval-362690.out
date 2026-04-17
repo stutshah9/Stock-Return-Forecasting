@@ -1,0 +1,56 @@
+/home/stutishah9/.local/lib/python3.9/site-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: `clean_up_tokenization_spaces` was not set. It will be set to `True` by default. This behavior will be depracted in transformers v4.45, and will be then set to `False` by default. For more details check this issue: https://github.com/huggingface/transformers/issues/31884
+  warnings.warn(
+Using device: cuda
+CUDA device: NVIDIA L40S
+Model parameter device: cuda:0
+torch.version.cuda: 12.1
+torch.cuda.is_available(): True
+torch.cuda.device_count(): 1
+CUDA current device index: 0
+CUDA memory after warmup: allocated=423.74 MB, reserved=472.00 MB
+| method               |   coverage_80 |   coverage_90 |   coverage_95 |   avg_width |       MAE |      RMSE |   dir_acc |
+|----------------------|---------------|---------------|---------------|-------------|-----------|-----------|-----------|
+| text_only            |     0.793829  |      0.932679 |      0.967742 |   0.17608   | 0.0328833 | 0.0474137 |  0.469846 |
+| financial_only       |     0.0715288 |      0.420757 |      0.723703 |   0.22563   | 0.127856  | 0.136372  |  0.530154 |
+| sentiment_only       |     0.0687237 |      0.448808 |      0.765778 |   0.222155  | 0.124351  | 0.131529  |  0.530154 |
+| full_multimodal      |     0.821879  |      0.921459 |      0.973352 |   0.178058  | 0.0292731 | 0.0454314 |  0.541374 |
+| naive_conformal      |     0.795231  |      0.921459 |      0.966339 |   0.15891   | 0.0292731 | 0.0454314 |  0.541374 |
+| ours                 |     0.828892  |      0.914446 |      0.964937 |   0.176659  | 0.0292731 | 0.0454314 |  0.541374 |
+| same_ticker_baseline |     0.54979   |      0.799439 |      0.906031 |   0.0942889 | 0.0297712 | 0.0466933 |  0.476858 |
+| method               | subgroup_type   | subgroup        |   n |   coverage_80 |   coverage_90 |   coverage_95 |   avg_width |
+|----------------------|-----------------|-----------------|-----|---------------|---------------|---------------|-------------|
+| text_only            | surprise_band   | high_surprise   |  56 |     0.839286  |      0.928571 |      1        |   0.236332  |
+| text_only            | surprise_band   | low_surprise    | 487 |     0.770021  |      0.932238 |      0.967146 |   0.159209  |
+| text_only            | surprise_band   | medium_surprise | 170 |     0.847059  |      0.935294 |      0.958824 |   0.204563  |
+| text_only            | volatility_band | high_vol        | 424 |     0.837264  |      0.957547 |      0.983491 |   0.200065  |
+| text_only            | volatility_band | low_vol         | 289 |     0.730104  |      0.896194 |      0.944637 |   0.140891  |
+| financial_only       | surprise_band   | high_surprise   |  56 |     0.107143  |      0.482143 |      1        |   0.307482  |
+| financial_only       | surprise_band   | low_surprise    | 487 |     0.0431211 |      0.38809  |      0.640657 |   0.203508  |
+| financial_only       | surprise_band   | medium_surprise | 170 |     0.141176  |      0.494118 |      0.870588 |   0.262042  |
+| financial_only       | volatility_band | high_vol        | 424 |     0.0872642 |      0.620283 |      0.896226 |   0.259806  |
+| financial_only       | volatility_band | low_vol         | 289 |     0.0484429 |      0.128028 |      0.470588 |   0.17549   |
+| sentiment_only       | surprise_band   | high_surprise   |  56 |     0.125     |      0.642857 |      1        |   0.298116  |
+| sentiment_only       | surprise_band   | low_surprise    | 487 |     0.0431211 |      0.396304 |      0.691992 |   0.200873  |
+| sentiment_only       | surprise_band   | medium_surprise | 170 |     0.123529  |      0.535294 |      0.9      |   0.2581    |
+| sentiment_only       | volatility_band | high_vol        | 424 |     0.0825472 |      0.669811 |      0.938679 |   0.252392  |
+| sentiment_only       | volatility_band | low_vol         | 289 |     0.0484429 |      0.124567 |      0.512111 |   0.177794  |
+| full_multimodal      | surprise_band   | high_surprise   |  56 |     0.839286  |      0.964286 |      1        |   0.240239  |
+| full_multimodal      | surprise_band   | low_surprise    | 487 |     0.806982  |      0.915811 |      0.973306 |   0.160824  |
+| full_multimodal      | surprise_band   | medium_surprise | 170 |     0.858824  |      0.923529 |      0.964706 |   0.206948  |
+| full_multimodal      | volatility_band | high_vol        | 424 |     0.849057  |      0.957547 |      0.990566 |   0.203068  |
+| full_multimodal      | volatility_band | low_vol         | 289 |     0.782007  |      0.868512 |      0.948097 |   0.141366  |
+| naive_conformal      | surprise_band   | high_surprise   |  56 |     0.767857  |      0.910714 |      0.964286 |   0.159946  |
+| naive_conformal      | surprise_band   | low_surprise    | 487 |     0.809035  |      0.930185 |      0.973306 |   0.158739  |
+| naive_conformal      | surprise_band   | medium_surprise | 170 |     0.764706  |      0.9      |      0.947059 |   0.159058  |
+| naive_conformal      | volatility_band | high_vol        | 424 |     0.799528  |      0.92217  |      0.971698 |   0.159668  |
+| naive_conformal      | volatility_band | low_vol         | 289 |     0.788927  |      0.920415 |      0.958478 |   0.157798  |
+| ours                 | surprise_band   | high_surprise   |  56 |     0.857143  |      0.928571 |      0.982143 |   0.200336  |
+| ours                 | surprise_band   | low_surprise    | 487 |     0.817248  |      0.913758 |      0.963039 |   0.160985  |
+| ours                 | surprise_band   | medium_surprise | 170 |     0.852941  |      0.911765 |      0.964706 |   0.21376   |
+| ours                 | volatility_band | high_vol        | 424 |     0.865566  |      0.95283  |      0.983491 |   0.201657  |
+| ours                 | volatility_band | low_vol         | 289 |     0.775087  |      0.858131 |      0.937716 |   0.139983  |
+| same_ticker_baseline | surprise_band   | high_surprise   |  56 |     0.589286  |      0.803571 |      0.857143 |   0.106027  |
+| same_ticker_baseline | surprise_band   | low_surprise    | 487 |     0.550308  |      0.819302 |      0.915811 |   0.0881335 |
+| same_ticker_baseline | surprise_band   | medium_surprise | 170 |     0.535294  |      0.741176 |      0.894118 |   0.108056  |
+| same_ticker_baseline | volatility_band | high_vol        | 424 |     0.549528  |      0.813679 |      0.915094 |   0.0956595 |
+| same_ticker_baseline | volatility_band | low_vol         | 289 |     0.550173  |      0.778547 |      0.892734 |   0.0922781 |

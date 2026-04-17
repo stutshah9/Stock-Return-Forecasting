@@ -106,7 +106,10 @@ class MultimodalForecastModel(nn.Module):
         self.embed_dim = int(model_config.get("embed_dim", 64))
         self.dropout = float(model_config.get("dropout", 0.1))
         self.text_frozen = bool(model_config.get("text_frozen", True))
-        self.cache_dir = data_config.get("cache_dir")
+        cache_dir = data_config.get("cache_dir")
+        if cache_dir is None and self.text_frozen:
+            cache_dir = str(Path(__file__).resolve().parents[1] / "data" / "transcript_cache")
+        self.cache_dir = cache_dir
         self.num_attention_heads = 4
         self.num_fusion_layers = int(model_config.get("fusion_layers", 2))
 
@@ -231,7 +234,15 @@ class MultimodalForecastModel(nn.Module):
         log_sigma = 0.5 * log_variance
 
         explanation_vec = self.explanation_head(fused_embedding)
-        introspective_score = self._attention_stability_score(attention_history)
+        attention_stability = self._attention_stability_score(attention_history)
+        sigma_center = log_sigma.detach().mean()
+        sigma_scale = log_sigma.detach().std(unbiased=False).clamp(min=1e-3)
+        sigma_confidence = torch.sigmoid(-(log_sigma - sigma_center) / sigma_scale)
+        introspective_score = torch.clamp(
+            0.5 * attention_stability + 0.5 * sigma_confidence,
+            min=0.0,
+            max=1.0,
+        )
 
         outputs: dict[str, Any] = {
             "mu": mu,
@@ -329,16 +340,34 @@ class MultimodalForecastModel(nn.Module):
             + math.log(2.0 * math.pi)
         ).mean()
 
-        mu_scaled = mu / mu.detach().std().clamp(min=1e-6)
-        dir_prob = torch.sigmoid(mu_scaled * 3.0)
+        mu_scale = mu.detach().std(unbiased=False).clamp(min=1e-6)
+        mu_scaled = mu / mu_scale
+        dir_logits = mu_scaled * 3.0
         dir_target = (targets > 0).float()
-        dir_loss = F.binary_cross_entropy(dir_prob, dir_target)
+        dir_loss = F.binary_cross_entropy_with_logits(dir_logits, dir_target)
 
-        total_loss = nll_loss + 0.3 * dir_loss
+        residual_scale_target = (targets - mu).detach().abs().clamp(min=1e-4, max=1.0)
+        uncertainty_alignment_loss = F.smooth_l1_loss(
+            output["log_sigma"],
+            torch.log(residual_scale_target),
+        )
+        uncertainty_alignment_weight = float(
+            self.config.get("training", {}).get("uncertainty_alignment_weight", 0.05)
+        )
+
+        total_loss = (
+            nll_loss
+            + 0.3 * dir_loss
+            + uncertainty_alignment_weight * uncertainty_alignment_loss
+        )
 
         if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
             print(f"dir_loss value: {dir_loss.item():.6f}")
             print(f"nll_loss value: {nll_loss.item():.6f}")
+            print(
+                "uncertainty_alignment_loss value: "
+                f"{uncertainty_alignment_loss.item():.6f}"
+            )
             print(f"total loss: {total_loss.item():.6f}")
             print(f"fraction of mu > 0: {(mu > 0).float().mean().item():.6f}")
             print(f"fraction of y > 0: {(targets > 0).float().mean().item():.6f}")

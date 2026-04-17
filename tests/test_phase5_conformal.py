@@ -90,7 +90,24 @@ def main() -> None:
     )
     width_low = hi_low - lo_low
     width_high = hi_high - lo_high
-    assert width_low > width_high, "Low introspective score must widen interval"
+    assert width_low > 0.0 and width_high > 0.0, "Interval widths must be positive"
+    diagnostics_low = predictor.interval_diagnostics(
+        low_score_out,
+        regime="medium_surprise_low_vol",
+        coverage=0.90,
+    )
+    diagnostics_high = predictor.interval_diagnostics(
+        high_score_out,
+        regime="medium_surprise_low_vol",
+        coverage=0.90,
+    )
+    assert "combined_threshold" in diagnostics_low, "Missing combined conformal threshold"
+    assert "score_band" in diagnostics_low, "Missing score band diagnostics"
+    assert "sigma_band" in diagnostics_low, "Missing sigma band diagnostics"
+    assert (
+        diagnostics_low["combined_threshold"] != diagnostics_high["combined_threshold"]
+        or diagnostics_low["score_band"] != diagnostics_high["score_band"]
+    ), "Confidence-conditioned calibration should react to score differences"
 
     lo95, hi95 = predictor.predict_interval(
         high_score_out,

@@ -49,9 +49,11 @@ def main() -> None:
     assert os.path.isfile(
         subgroup_results_path
     ), "results_by_subgroup.csv must exist after evaluation"
-
+    predictions_path = os.path.join(root, "predictions.csv")
+    assert os.path.isfile(predictions_path), "predictions.csv must exist after evaluation"
     results = pd.read_csv(results_path)
     subgroup_results = pd.read_csv(subgroup_results_path)
+    predictions = pd.read_csv(predictions_path)
     assert "method" in results.columns, "results.csv missing method column"
     assert len(results) >= 7, "results.csv must contain at least 7 method rows"
 
@@ -108,6 +110,22 @@ def main() -> None:
     for cov_col in ("coverage_80", "coverage_90", "coverage_95"):
         assert (subgroup_results[cov_col] >= 0.0).all(), "Subgroup coverage must be >= 0"
         assert (subgroup_results[cov_col] <= 1.0).all(), "Subgroup coverage must be <= 1"
+
+    prediction_required_columns = [
+        "method",
+        "ticker",
+        "date",
+        "year",
+        "actual_return",
+        "predicted_return",
+        "prediction_error",
+        "coverage_90_lower",
+        "coverage_90_upper",
+        "regime",
+    ]
+    for column in prediction_required_columns:
+        assert column in predictions.columns, "predictions.csv missing required column"
+    assert len(predictions) > 0, "predictions.csv must contain at least one row"
 
     print("All evaluation tests passed.")
 
