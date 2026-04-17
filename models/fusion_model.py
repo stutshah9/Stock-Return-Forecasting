@@ -329,10 +329,11 @@ class MultimodalForecastModel(nn.Module):
             + math.log(2.0 * math.pi)
         ).mean()
 
-        mu_scaled = mu / mu.detach().std().clamp(min=1e-6)
-        dir_prob = torch.sigmoid(mu_scaled * 3.0)
+        mu_scale = mu.detach().std(unbiased=False).clamp(min=1e-6)
+        mu_scaled = mu / mu_scale
+        dir_logits = mu_scaled * 3.0
         dir_target = (targets > 0).float()
-        dir_loss = F.binary_cross_entropy(dir_prob, dir_target)
+        dir_loss = F.binary_cross_entropy_with_logits(dir_logits, dir_target)
 
         total_loss = nll_loss + 0.3 * dir_loss
 

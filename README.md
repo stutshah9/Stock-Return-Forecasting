@@ -45,7 +45,8 @@ The pipeline is split into:
 Current split behavior in code:
 
 - train years: `<= 2022`
-- calibration years: `2023` and `2024`
+- validation year: `2023`
+- calibration year: `2024`
 - test year: `2025`
 
 Note: while `config.yaml` contains a `data.split` block, current train/evaluate
@@ -162,9 +163,10 @@ What happens:
 
 - cached events are loaded from `data/events_cache.pt`
 - events are filtered to the configured universe, currently `sp500`
-- events are split with current fixed code logic: train `<= 2022`, calibration `2023-2024`, test `2025`
+- events are split with current fixed code logic: train `<= 2022`, validation `2023`, calibration `2024`, test `2025`
 - only the training split is used for gradient updates
-- the calibration split is used for loss-based early stopping and then reused later for conformal calibration during evaluation
+- the validation split is used for early stopping
+- the calibration split is reserved for conformal calibration during evaluation
 - model weights are saved to `experiments/model.pt`
 - calibration outputs are saved to `data/cal_outputs.pt`
 
@@ -216,10 +218,24 @@ It also saves subgroup-stratified metrics by surprise band and volatility regime
 experiments/results_by_subgroup.csv
 ```
 
+Selective prediction / abstention is kept as an optional add-on rather than a
+default headline result. If you explicitly enable it in `config.yaml`, the
+evaluation script will also write:
+
+```text
+experiments/results_selective.csv
+```
+
 And saves the CSV to:
 
 ```text
 experiments/results.csv
+```
+
+It also exports per-event test predictions to:
+
+```text
+experiments/predictions.csv
 ```
 
 Compatibility artifact also saved to project root:
@@ -227,6 +243,24 @@ Compatibility artifact also saved to project root:
 ```text
 results.csv
 ```
+
+To print a few real-vs-predicted examples from the held-out test set:
+
+```bash
+python3 experiments/show_prediction_examples.py --year 2025 --ticker AAPL --date 2025-05-01 --limit 20
+python3 experiments/show_prediction_examples.py --method all --year 2025 --ticker MSFT --limit 20
+```
+
+For a simple local frontend after evaluation:
+
+```bash
+python3 -m pip install gradio
+python3 frontend/prediction_viewer.py
+```
+
+Then open the local URL Gradio prints and pick the year, method, ticker, and
+date to inspect predicted vs real return values and the calibrated intervals for
+all methods side-by-side.
 
 ## Mass Train And Test
 
@@ -379,3 +413,7 @@ python3 experiments/evaluate.py
 
 # pull data from ARC
 rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ /Users/Stuti/Stock-Return-Forecasting/
+
+# run frontend
+python3 -m pip install gradio
+python3 frontend/prediction_viewer.py

@@ -6,6 +6,7 @@ data:
   universe: sp500
   split:
     strategy: year
+    validation_years: [2023]
     calibration_years: [2024]
     test_years: [2025]
     allow_synthetic_fallback: false
@@ -16,9 +17,20 @@ model:
 
 training:
   device: cuda
-  lr: 1e-4
+  seed: 42
+  lr: 5e-5
   batch_size: 32
   epochs: 30
+  use_amp: true
+  grad_clip_norm: 1.0
 
 calibration:
   coverage_levels: [0.80, 0.90, 0.95]
+  regime_fit_quantiles:
+    low_surprise: 0.60
+    high_surprise: 0.90
+    high_vol: 0.60
+  selective_min_scores: [0.55, 0.70, 0.85]
+
+evaluation:
+  include_selective_analysis: false
