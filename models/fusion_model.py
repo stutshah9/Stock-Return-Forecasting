@@ -334,12 +334,7 @@ class MultimodalForecastModel(nn.Module):
         dir_target = (targets > 0).float()
         dir_loss = F.binary_cross_entropy(dir_prob, dir_target)
 
-        introspective_score = output["introspective_score"].detach()
-        expected_uncertainty = 1.0 - introspective_score
-        actual_uncertainty = torch.sigmoid(log_variance)
-        alignment_loss = F.mse_loss(actual_uncertainty, expected_uncertainty)
-
-        total_loss = nll_loss + 0.3 * dir_loss + 0.1 * alignment_loss
+        total_loss = nll_loss + 0.3 * dir_loss
 
         if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
             print(f"dir_loss value: {dir_loss.item():.6f}")
