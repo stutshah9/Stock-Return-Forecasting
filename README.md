@@ -367,7 +367,7 @@ done
 - `experiments/evaluate.py`: evaluation entry point
 
 # upload data to ARC
-rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
+rsync -avh --progress /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
