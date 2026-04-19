@@ -45,11 +45,17 @@ The pipeline is split into:
 Current split behavior in code:
 
 - train years: `<= 2022`
-- calibration years: `2023` and `2024`
+- validation year: `2023`
+- calibration year: `2024`
 - test year: `2025`
 
-Note: while `config.yaml` contains a `data.split` block, current train/evaluate
-scripts use the fixed year split above.
+The train/evaluate scripts read the year lists from `config.yaml`'s
+`data.split` block. The default values in this repo are still:
+
+- train years: `<= 2022`
+- validation year: `2023`
+- calibration year: `2024`
+- test year: `2025`
 
 ## Quick Sanity Check
 
@@ -63,6 +69,10 @@ python3 experiments/train.py --dry-run
 This is the fastest way to verify model construction, forward pass, loss, and artifact writing.
 
 To run full evaluation, you must have `data/events_cache.pt` available (see "Run End To End").
+
+When the transcript encoder is frozen, transcript chunk embeddings are cached under
+`data/transcript_cache/` by default so repeated epochs and evaluation passes do
+not re-encode identical transcripts from scratch.
 
 ## Run End To End
 
@@ -162,9 +172,10 @@ What happens:
 
 - cached events are loaded from `data/events_cache.pt`
 - events are filtered to the configured universe, currently `sp500`
-- events are split with current fixed code logic: train `<= 2022`, calibration `2023-2024`, test `2025`
+- events are split with current fixed code logic: train `<= 2022`, validation `2023`, calibration `2024`, test `2025`
 - only the training split is used for gradient updates
-- the calibration split is used for loss-based early stopping and then reused later for conformal calibration during evaluation
+- the validation split is used for early stopping
+- the calibration split is reserved for conformal calibration during evaluation
 - model weights are saved to `experiments/model.pt`
 - calibration outputs are saved to `data/cal_outputs.pt`
 
@@ -198,6 +209,7 @@ This evaluates:
 - `full_multimodal`
 - `naive_conformal`
 - `ours`
+- `ours_explanation_augmented`
 - `same_ticker_baseline`
 
 The script prints a results table with:
@@ -210,10 +222,19 @@ The script prints a results table with:
 - `RMSE`
 - `dir_acc`
 
-It also saves subgroup-stratified metrics by surprise band and volatility regime to:
+It also saves subgroup-stratified metrics by surprise band, volatility regime,
+and attention-volume band to:
 
 ```text
 experiments/results_by_subgroup.csv
+```
+
+Selective prediction / abstention is kept as an optional add-on rather than a
+default headline result. If you explicitly enable it in `config.yaml`, the
+evaluation script will also write:
+
+```text
+experiments/results_selective.csv
 ```
 
 And saves the CSV to:
@@ -222,11 +243,70 @@ And saves the CSV to:
 experiments/results.csv
 ```
 
+It also exports per-event test predictions to:
+
+```text
+experiments/predictions.csv
+```
+
 Compatibility artifact also saved to project root:
 
 ```text
 results.csv
 ```
+
+To print a few real-vs-predicted examples from the held-out test set:
+
+```bash
+python3 experiments/show_prediction_examples.py --year 2025 --ticker AAPL --date 2025-05-01 --limit 20
+python3 experiments/show_prediction_examples.py --method all --year 2025 --ticker MSFT --limit 20
+```
+
+## Hyperparameter Sweep
+
+To search for the strongest overall checkpoint under the proposal-style
+validation objective instead of manually comparing runs:
+
+```bash
+cd /Users/Stuti/Stock-Return-Forecasting
+python3 experiments/sweep.py
+```
+
+This sweep:
+
+- perturbs learning rate plus the uncertainty/confidence alignment weights
+- trains and evaluates each candidate config
+- saves per-run configs, logs, and CSV outputs under `experiments/sweeps/...`
+- ranks runs by validation `proposal_score`
+- reruns the selected best config and saves its final artifacts under
+  `experiments/sweeps/.../best/`
+
+On Falcon, submit the sweep with:
+
+```bash
+sbatch scripts/falcon_sweep.sbatch
+```
+
+For a simple local frontend after evaluation:
+
+```bash
+python3 -m pip install gradio
+python3 frontend/prediction_viewer.py
+```
+
+Then open the local URL Gradio prints and pick a company ticker plus event date.
+The viewer now centers the proposal-style `ours` calibration and shows:
+
+- the calibrated 80/90/95 percent return range for the selected company event
+- the model's expected return and the actual realized return
+- whether the realized return landed inside the calibrated interval
+- the reported-vs-estimated earnings values when they exist in `data/financials.csv`
+- a side-by-side method comparison table for the same event
+
+In the current evaluation code, `ours` is the main event-conditioned conformal
+method based on observable event features, while
+`ours_explanation_augmented` is kept as a lighter ablation that optionally
+widens intervals when the model's auxiliary confidence score is low.
 
 ## Mass Train And Test
 
@@ -367,7 +447,7 @@ done
 - `experiments/evaluate.py`: evaluation entry point
 
 # upload data to ARC
-rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
+rsync -avh --progress /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
@@ -379,3 +459,7 @@ python3 experiments/evaluate.py
 
 # pull data from ARC
 rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ /Users/Stuti/Stock-Return-Forecasting/
+
+# run frontend locally
+python3 -m pip install gradio
+python3 frontend/prediction_viewer.py

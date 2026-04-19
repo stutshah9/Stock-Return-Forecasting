@@ -6,9 +6,11 @@ import argparse
 import json
 import math
 from pathlib import Path
+import random
 import sys
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.optim import AdamW
@@ -16,12 +18,29 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
 
+try:
+    from torch.amp import autocast as _autocast
+except ImportError:  # pragma: no cover - older torch fallback
+    from torch.cuda.amp import autocast as _autocast
+
+try:
+    from torch.amp import GradScaler as _GradScaler
+
+    def _make_grad_scaler(device_type: str, enabled: bool) -> Any:
+        return _GradScaler(device_type, enabled=enabled)
+
+except ImportError:  # pragma: no cover - older torch fallback
+    from torch.cuda.amp import GradScaler as _GradScaler
+
+    def _make_grad_scaler(device_type: str, enabled: bool) -> Any:
+        return _GradScaler(enabled=enabled)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from calibration.conformal import assign_regime
+from calibration.conformal import assign_regime, fit_regime_thresholds
 from data.dataset import EarningsDataset
 from data.event_utils import (
     build_synthetic_events as _shared_build_synthetic_events,
@@ -35,6 +54,9 @@ from models.fusion_model import MultimodalForecastModel
 _CLI_DRY_RUN = False
 EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
+REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
+BEST_MODEL_PATH = PROJECT_ROOT / "experiments" / "model_best.pt"
+TRAINING_SUMMARY_PATH = PROJECT_ROOT / "experiments" / "training_summary.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -51,6 +73,16 @@ def _load_config(config_path: Path) -> dict[str, Any]:
 
     with config_path.open("r", encoding="utf-8") as config_file:
         return yaml.safe_load(config_file) or {}
+
+
+def _set_seed(seed: int) -> None:
+    """Set random seeds for more reproducible training runs."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _build_dry_run_events() -> list[dict[str, Any]]:
@@ -103,31 +135,43 @@ def _load_cached_events() -> list[dict[str, Any]]:
 
 def _split_events_by_year(
     events: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split cached events into fixed year-based train/calibration/test partitions."""
+    split_config: dict[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Split cached events into train/validation/calibration/test partitions."""
 
     sorted_events = sorted(events, key=lambda event: (int(event["year"]), str(event["date"])))
-    train_events = [event for event in sorted_events if int(event["year"]) <= 2022]
-    cal_events = [
-        event for event in sorted_events if int(event["year"]) in {2023, 2024}
-    ]
-    test_events = [event for event in sorted_events if int(event["year"]) == 2025]
+    validation_years = {int(year) for year in split_config.get("validation_years", [2023])}
+    calibration_years = {int(year) for year in split_config.get("calibration_years", [2024])}
+    test_years = {int(year) for year in split_config.get("test_years", [2025])}
+    reserved_years = validation_years | calibration_years | test_years
 
-    if not train_events or not cal_events or not test_events:
+    train_events = [event for event in sorted_events if int(event["year"]) not in reserved_years]
+    val_events = [event for event in sorted_events if int(event["year"]) in validation_years]
+    cal_events = [event for event in sorted_events if int(event["year"]) in calibration_years]
+    test_events = [event for event in sorted_events if int(event["year"]) in test_years]
+
+    if not train_events or not val_events or not cal_events or not test_events:
         raise ValueError(
             "Year-based cache split produced an empty partition. "
-            "Expected train years <= 2022, calibration years 2023-2024, "
-            "and test year 2025."
+            f"Expected validation_years={sorted(validation_years)}, "
+            f"calibration_years={sorted(calibration_years)}, "
+            f"test_years={sorted(test_years)}."
         )
-    return train_events, cal_events, test_events
+    return train_events, val_events, cal_events, test_events
 
 
 def _assert_disjoint_splits(
     train_events: list[dict[str, Any]],
+    val_events: list[dict[str, Any]],
     cal_events: list[dict[str, Any]],
     test_events: list[dict[str, Any]],
 ) -> None:
-    """Ensure train/calibration/test events are strictly disjoint."""
+    """Ensure train/validation/calibration/test events are strictly disjoint."""
 
     def _keys(events: list[dict[str, Any]]) -> set[tuple[str, str]]:
         return {
@@ -136,17 +180,27 @@ def _assert_disjoint_splits(
         }
 
     train_keys = _keys(train_events)
+    val_keys = _keys(val_events)
     cal_keys = _keys(cal_events)
     test_keys = _keys(test_events)
+    if train_keys & val_keys:
+        raise ValueError("Training and validation splits overlap.")
     if train_keys & cal_keys:
         raise ValueError("Training and calibration splits overlap.")
     if train_keys & test_keys:
         raise ValueError("Training and test splits overlap.")
+    if val_keys & cal_keys:
+        raise ValueError("Validation and calibration splits overlap.")
+    if val_keys & test_keys:
+        raise ValueError("Validation and test splits overlap.")
     if cal_keys & test_keys:
         raise ValueError("Calibration and test splits overlap.")
 
 
-def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+def _collate_batch(
+    batch: list[dict[str, Any]],
+    regime_thresholds: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Collate dataset samples into model-ready tensors and metadata."""
 
     transcripts = [str(item["transcript"]) for item in batch]
@@ -157,6 +211,7 @@ def _collate_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         assign_regime(
             sue=float(item["raw_features"][0].item()),
             implied_vol=float(item["raw_features"][2].item()),
+            thresholds=regime_thresholds,
         )
         for item in batch
     ]
@@ -243,13 +298,41 @@ def _serialize_output_batch(outputs: dict[str, Tensor]) -> list[dict[str, float]
     mu_values = outputs["mu"].detach().cpu().tolist()
     log_sigma_values = outputs["log_sigma"].detach().cpu().tolist()
     score_values = outputs["introspective_score"].detach().cpu().tolist()
+    attention_values = outputs.get("attention_stability")
+    variance_values = outputs.get("variance_confidence")
+    modality_values = outputs.get("modality_consistency")
+    attention_list = (
+        attention_values.detach().cpu().tolist()
+        if attention_values is not None
+        else [0.0 for _ in mu_values]
+    )
+    variance_list = (
+        variance_values.detach().cpu().tolist()
+        if variance_values is not None
+        else [0.0 for _ in mu_values]
+    )
+    modality_list = (
+        modality_values.detach().cpu().tolist()
+        if modality_values is not None
+        else [0.0 for _ in mu_values]
+    )
 
-    for mu, log_sigma, score in zip(mu_values, log_sigma_values, score_values):
+    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
+        mu_values,
+        log_sigma_values,
+        score_values,
+        attention_list,
+        variance_list,
+        modality_list,
+    ):
         serialized.append(
             {
                 "mu": float(mu),
                 "log_sigma": float(log_sigma),
                 "introspective_score": float(score),
+                "attention_stability": float(attention),
+                "variance_confidence": float(variance_confidence),
+                "modality_consistency": float(modality_consistency),
             }
         )
     return serialized
@@ -281,6 +364,107 @@ def _run_inference(
     return outputs_list, labels_list, regimes_list
 
 
+def _regression_metrics(
+    outputs: list[dict[str, float]],
+    labels: list[float],
+) -> dict[str, float]:
+    """Compute lightweight point-forecast metrics from serialized outputs."""
+
+    if not outputs or not labels:
+        return {"mae": float("nan"), "rmse": float("nan")}
+
+    mu_values = np.asarray([float(output["mu"]) for output in outputs], dtype=float)
+    label_values = np.asarray([float(label) for label in labels], dtype=float)
+    residuals = mu_values - label_values
+    return {
+        "mae": float(np.mean(np.abs(residuals))),
+        "rmse": float(np.sqrt(np.mean(residuals ** 2))),
+    }
+
+
+def _confidence_target_from_residuals(residuals: np.ndarray) -> np.ndarray:
+    """Map smaller absolute residuals to higher bounded confidence targets."""
+
+    magnitudes = np.clip(np.abs(residuals), 1e-4, 1.0)
+    center = float(np.mean(magnitudes))
+    scale = max(float(np.std(magnitudes)), 1e-3)
+    return 1.0 / (1.0 + np.exp((magnitudes - center) / scale))
+
+
+def _validation_objectives(
+    outputs: list[dict[str, float]],
+    labels: list[float],
+) -> dict[str, float]:
+    """Compute a balanced validation summary for checkpoint selection."""
+
+    if not outputs or not labels:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "dir_acc": float("nan"),
+            "confidence_brier": float("nan"),
+            "variance_brier": float("nan"),
+            "selective_mae": float("nan"),
+            "proposal_score": float("inf"),
+        }
+
+    mu_values = np.asarray([float(output["mu"]) for output in outputs], dtype=float)
+    label_values = np.asarray([float(label) for label in labels], dtype=float)
+    residuals = mu_values - label_values
+    mae = float(np.mean(np.abs(residuals)))
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    dir_acc = float(np.mean(np.sign(mu_values) == np.sign(label_values)))
+
+    confidence_target = _confidence_target_from_residuals(residuals)
+    introspective_scores = np.asarray(
+        [float(output.get("introspective_score", 0.5)) for output in outputs],
+        dtype=float,
+    )
+    variance_confidences = np.asarray(
+        [
+            float(
+                output.get(
+                    "variance_confidence",
+                    1.0 / (1.0 + math.exp(float(output.get("log_sigma", 0.0)))),
+                )
+            )
+            for output in outputs
+        ],
+        dtype=float,
+    )
+    confidence_brier = float(np.mean((introspective_scores - confidence_target) ** 2))
+    variance_brier = float(np.mean((variance_confidences - confidence_target) ** 2))
+
+    selective_mask = introspective_scores >= max(float(np.median(introspective_scores)), 0.60)
+    if np.any(selective_mask):
+        selective_mae = float(np.mean(np.abs(residuals[selective_mask])))
+    else:
+        selective_mae = mae
+
+    # Lower is better. The main project objective remains reliable calibrated
+    # forecasting, but for checkpoint selection we keep point error and
+    # directionality primary and only lightly regularize the auxiliary
+    # introspection signals.
+    proposal_score = (
+        100.0 * rmse
+        + 40.0 * mae
+        + 4.0 * (1.0 - dir_acc)
+        + 1.5 * confidence_brier
+        + 1.0 * variance_brier
+        + 5.0 * selective_mae
+    )
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "dir_acc": dir_acc,
+        "confidence_brier": confidence_brier,
+        "variance_brier": variance_brier,
+        "selective_mae": selective_mae,
+        "proposal_score": float(proposal_score),
+    }
+
+
 def train(config_path: str) -> None:
     """Train the multimodal forecast model and save calibration artifacts.
 
@@ -292,8 +476,15 @@ def train(config_path: str) -> None:
     config = _load_config(config_file)
     training_config = config.get("training", {})
     data_config = config.get("data", {})
+    split_config = data_config.get("split", {})
     batch_size = int(training_config.get("batch_size", 32))
     epochs = int(training_config.get("epochs", 20))
+    seed = int(training_config.get("seed", 42))
+    use_amp = bool(training_config.get("use_amp", True))
+    grad_clip_norm = float(training_config.get("grad_clip_norm", 1.0))
+    early_stop_metric = str(training_config.get("early_stop_metric", "rmse")).strip().lower()
+
+    _set_seed(seed)
 
     if _CLI_DRY_RUN:
         events = _build_dry_run_events()
@@ -328,39 +519,60 @@ def train(config_path: str) -> None:
     _log_device_diagnostics(device, model)
 
     try:
-        train_events, cal_events, test_events = _split_events_by_year(events)
+        train_events, val_events, cal_events, test_events = _split_events_by_year(
+            events,
+            split_config,
+        )
     except Exception as exc:
         raise ValueError(f"Could not build the requested split. {exc}") from exc
-    _assert_disjoint_splits(train_events, cal_events, test_events)
+    _assert_disjoint_splits(train_events, val_events, cal_events, test_events)
 
     feature_stats = EarningsDataset.compute_feature_stats(train_events)
     FEATURE_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with FEATURE_STATS_PATH.open("w", encoding="utf-8") as stats_file:
         json.dump(feature_stats, stats_file)
+    regime_fit_config = config.get("calibration", {}).get("regime_fit_quantiles", {})
+    regime_thresholds = fit_regime_thresholds(
+        train_events + val_events,
+        low_quantile=float(regime_fit_config.get("low_surprise", 0.60)),
+        high_quantile=float(regime_fit_config.get("high_surprise", 0.90)),
+        vol_quantile=float(regime_fit_config.get("high_vol", 0.60)),
+    )
+    with REGIME_THRESHOLDS_PATH.open("w", encoding="utf-8") as thresholds_file:
+        json.dump(regime_thresholds, thresholds_file)
 
     train_dataset = EarningsDataset(train_events, feature_stats=feature_stats)
+    val_dataset = EarningsDataset(val_events, feature_stats=feature_stats)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
+    collate_fn = lambda batch: _collate_batch(batch, regime_thresholds=regime_thresholds)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=_collate_batch,
+        collate_fn=collate_fn,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
     )
     cal_loader = DataLoader(
         cal_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=_collate_batch,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=_collate_batch,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
     )
 
@@ -369,10 +581,23 @@ def train(config_path: str) -> None:
         lr=float(training_config.get("lr", 1e-4)),
         weight_decay=1e-4,
     )
+    scaler = _make_grad_scaler(
+        device.type,
+        enabled=device.type == "cuda" and use_amp,
+    )
 
-    best_cal_loss = float("inf")
+    if early_stop_metric not in {"loss", "rmse", "mae", "proposal_score"}:
+        raise ValueError(
+            "training.early_stop_metric must be one of: "
+            "loss, rmse, mae, proposal_score."
+        )
+
+    best_val_score = float("inf")
+    best_epoch = 0
+    best_val_metrics: dict[str, float] = {}
     patience_counter = 0
     PATIENCE = 5
+    validation_history: list[dict[str, float | int]] = []
 
     for epoch_index in range(epochs):
         model.train()
@@ -391,14 +616,22 @@ def train(config_path: str) -> None:
             batch = _move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(
-                transcripts=batch["transcripts"],
-                financial=batch["financial"],
-                sentiment=batch["sentiment"],
-            )
-            loss = model.loss(outputs, batch["labels"])
-            loss.backward()
-            optimizer.step()
+            with _autocast(
+                device_type=device.type,
+                enabled=device.type == "cuda" and use_amp,
+            ):
+                outputs = model(
+                    transcripts=batch["transcripts"],
+                    financial=batch["financial"],
+                    sentiment=batch["sentiment"],
+                )
+                loss = model.loss(outputs, batch["labels"])
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += float(loss.item())
             batch_count += 1
@@ -411,29 +644,88 @@ def train(config_path: str) -> None:
         tqdm.write(f"Epoch {epoch_index + 1}/{epochs} train_loss={epoch_loss:.4f}")
 
         model.eval()
-        cal_loss_total = 0.0
+        val_loss_total = 0.0
+        val_outputs: list[dict[str, float]] = []
+        val_labels: list[float] = []
         with torch.no_grad():
-            for batch in cal_loader:
+            for batch in val_loader:
                 batch = _move_batch_to_device(batch, device)
-                out = model(
-                    transcripts=batch["transcripts"],
-                    financial=batch["financial"],
-                    sentiment=batch["sentiment"],
-                )
-                cal_loss_total += model.loss(out, batch["labels"]).item()
-        cal_loss_avg = cal_loss_total / len(cal_loader)
-        print(f"  cal_loss={cal_loss_avg:.4f}")
+                with _autocast(
+                    device_type=device.type,
+                    enabled=device.type == "cuda" and use_amp,
+                ):
+                    out = model(
+                        transcripts=batch["transcripts"],
+                        financial=batch["financial"],
+                        sentiment=batch["sentiment"],
+                    )
+                    val_loss_total += model.loss(out, batch["labels"]).item()
+                val_outputs.extend(_serialize_output_batch(out))
+                val_labels.extend(float(value) for value in batch["labels"].cpu().tolist())
+        val_loss_avg = val_loss_total / len(val_loader)
+        val_metrics = _validation_objectives(val_outputs, val_labels)
+        val_rmse = float(val_metrics["rmse"])
+        val_mae = float(val_metrics["mae"])
+        val_dir_acc = float(val_metrics["dir_acc"])
+        val_confidence_brier = float(val_metrics["confidence_brier"])
+        val_selective_mae = float(val_metrics["selective_mae"])
+        val_proposal_score = float(val_metrics["proposal_score"])
+        print(
+            "  "
+            f"val_loss={val_loss_avg:.4f} "
+            f"val_rmse={val_rmse:.4f} "
+            f"val_mae={val_mae:.4f} "
+            f"val_dir_acc={val_dir_acc:.4f} "
+            f"val_conf_brier={val_confidence_brier:.4f} "
+            f"val_selective_mae={val_selective_mae:.4f} "
+            f"val_proposal_score={val_proposal_score:.4f}"
+        )
+        validation_history.append(
+            {
+                "epoch": int(epoch_index + 1),
+                "train_loss": float(epoch_loss),
+                "val_loss": float(val_loss_avg),
+                "val_rmse": float(val_rmse),
+                "val_mae": float(val_mae),
+                "val_dir_acc": float(val_dir_acc),
+                "val_confidence_brier": float(val_confidence_brier),
+                "val_selective_mae": float(val_selective_mae),
+                "val_proposal_score": float(val_proposal_score),
+            }
+        )
         model.train()
 
-        if cal_loss_avg < best_cal_loss:
-            best_cal_loss = cal_loss_avg
+        current_val_score = {
+            "loss": val_loss_avg,
+            "rmse": val_rmse,
+            "mae": val_mae,
+            "proposal_score": val_proposal_score,
+        }[early_stop_metric]
+
+        if current_val_score < best_val_score:
+            best_val_score = current_val_score
+            best_epoch = epoch_index + 1
+            best_val_metrics = {
+                "val_loss": float(val_loss_avg),
+                "val_rmse": float(val_rmse),
+                "val_mae": float(val_mae),
+                "val_dir_acc": float(val_dir_acc),
+                "val_confidence_brier": float(val_confidence_brier),
+                "val_selective_mae": float(val_selective_mae),
+                "val_proposal_score": float(val_proposal_score),
+            }
             patience_counter = 0
-            torch.save(model.state_dict(), PROJECT_ROOT / "experiments" / "model_best.pt")
+            torch.save(model.state_dict(), BEST_MODEL_PATH)
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
                 print(f"Early stopping at epoch {epoch_index + 1}")
                 break
+
+    if BEST_MODEL_PATH.is_file():
+        best_state_dict = torch.load(BEST_MODEL_PATH, map_location="cpu")
+        model.load_state_dict(best_state_dict, strict=False)
+        model.to(device)
 
     cal_outputs, cal_labels, cal_regimes = _run_inference(model, cal_loader, device)
     _run_inference(model, test_loader, device)
@@ -448,8 +740,17 @@ def train(config_path: str) -> None:
         "labels": cal_labels,
         "regimes": cal_regimes,
     }
+    training_summary = {
+        "early_stop_metric": early_stop_metric,
+        "best_val_score": float(best_val_score),
+        "best_epoch": int(best_epoch),
+        "best_metrics": best_val_metrics,
+        "history": validation_history,
+    }
     torch.save(saved_calibration, data_output_path)
     torch.save(model.state_dict(), model_output_path)
+    with TRAINING_SUMMARY_PATH.open("w", encoding="utf-8") as summary_file:
+        json.dump(training_summary, summary_file, indent=2)
 
     # Keep compatibility with existing local tests while also saving to spec paths.
     torch.save(saved_calibration, legacy_cal_output_path)

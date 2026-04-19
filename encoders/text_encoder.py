@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import nullcontext
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,16 @@ class TranscriptEncoder(nn.Module):
             return None
         return self.cache_dir / f"{safe_key}.pt"
 
+    def _default_cache_keys(self, texts: list[str]) -> list[str]:
+        """Build stable cache keys from transcript content when callers do not provide them."""
+
+        cache_keys: list[str] = []
+        for text in texts:
+            normalized_text = str(text)
+            digest = hashlib.sha1(normalized_text.encode("utf-8")).hexdigest()[:16]
+            cache_keys.append(f"text_{digest}")
+        return cache_keys
+
     def _chunk_token_ids(self, token_ids: list[int]) -> list[list[int]]:
         """Split token ids into overlapping sliding-window chunks.
 
@@ -277,20 +288,27 @@ class TranscriptEncoder(nn.Module):
         if not texts:
             return torch.empty((0, self.embed_dim), device=device)
 
-        transcript_embeddings: list[Tensor] = []
-        for index, text in enumerate(texts):
-            cache_path = self._cache_path(index)
-            chunk_embeddings = self._load_cached_chunk_embeddings(cache_path)
-            if chunk_embeddings is None:
-                chunk_embeddings = self._compute_chunk_embeddings(text)
-                self._save_cached_chunk_embeddings(cache_path, chunk_embeddings)
+        previous_cache_keys = self.cache_keys
+        if self.cache_dir is not None and self.cache_keys is None:
+            self.cache_keys = self._default_cache_keys(texts)
 
-            chunk_embeddings = chunk_embeddings.to(device)
-            if chunk_embeddings.numel() == 0:
-                transcript_embedding = torch.zeros(hidden_size, device=device)
-            else:
-                transcript_embedding = chunk_embeddings.mean(dim=0)
-            transcript_embeddings.append(transcript_embedding)
+        transcript_embeddings: list[Tensor] = []
+        try:
+            for index, text in enumerate(texts):
+                cache_path = self._cache_path(index)
+                chunk_embeddings = self._load_cached_chunk_embeddings(cache_path)
+                if chunk_embeddings is None:
+                    chunk_embeddings = self._compute_chunk_embeddings(text)
+                    self._save_cached_chunk_embeddings(cache_path, chunk_embeddings)
+
+                chunk_embeddings = chunk_embeddings.to(device)
+                if chunk_embeddings.numel() == 0:
+                    transcript_embedding = torch.zeros(hidden_size, device=device)
+                else:
+                    transcript_embedding = chunk_embeddings.mean(dim=0)
+                transcript_embeddings.append(transcript_embedding)
+        finally:
+            self.cache_keys = previous_cache_keys
 
         stacked_embeddings = torch.stack(transcript_embeddings, dim=0)
         return self.projection(stacked_embeddings)

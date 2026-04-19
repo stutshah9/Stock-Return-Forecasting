@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ipynb_checkpoints/
 .DS_Store
+*.out
 .env
 data/raw/*
 !data/raw/.gitkeep
@@ -16,3 +17,12 @@ cal_outputs.pt
 events_cache.pt
 transcripts.csv
 model.pt
+home/
+experiments/sweeps/
+data/collect_errors.log
+data/build_cache_errors.log
+experiments/training_summary.json
+predictions.csv
+results.csv
+results_by_subgroup.csv
+results_selective.csv

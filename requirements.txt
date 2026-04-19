@@ -16,4 +16,4 @@ lxml
 datasets
 huggingface_hub
 python-dotenv
-AutoModel
+gradio
