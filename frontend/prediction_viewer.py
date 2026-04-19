@@ -87,6 +87,18 @@ APP_CSS = """
     background: rgba(148, 163, 184, 0.16);
     color: #334155;
 }
+.table-card table {
+    table-layout: fixed;
+    width: 100%;
+}
+.table-card th,
+.table-card td {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    font-size: 0.83rem;
+    line-height: 1.25;
+}
 @media (max-width: 900px) {
     .metric-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -216,16 +228,16 @@ def _company_history(company: str, coverage: str) -> pd.DataFrame:
         {
             "Date": frame["date"].astype(str),
             "Regime": frame["regime"].map(_format_regime),
-            "Expected Return": frame["expected_return"].map(_format_decimal),
-            "Actual Return": frame["actual_return"].map(_format_decimal),
+            "Expected": frame["expected_return"].map(_format_decimal),
+            "Actual": frame["actual_return"].map(_format_decimal),
             f"{coverage}% Range": frame[f"interval_{coverage}"].astype(str),
-            "Inside Range": frame.apply(lambda row: _interval_hit(row, coverage), axis=1),
+            "Inside": frame.apply(lambda row: _interval_hit(row, coverage), axis=1),
         }
     )
 
     if "estimated_earnings" in frame.columns and "actual_earnings" in frame.columns:
-        history["Estimated EPS"] = frame["estimated_earnings"].map(_format_decimal)
-        history["Reported EPS"] = frame["actual_earnings"].map(_format_decimal)
+        history["Est. EPS"] = frame["estimated_earnings"].map(_format_decimal)
+        history["Rpt. EPS"] = frame["actual_earnings"].map(_format_decimal)
     return history
 
 
@@ -245,11 +257,11 @@ def _method_comparison(company: str, date: str, coverage: str) -> pd.DataFrame:
     comparison = pd.DataFrame(
         {
             "Method": frame["method"].map(_format_method_name),
-            "Expected Return": frame["expected_return"].map(_format_decimal),
-            "Actual Return": frame["actual_return"].map(_format_decimal),
+            "Expected": frame["expected_return"].map(_format_decimal),
+            "Actual": frame["actual_return"].map(_format_decimal),
             f"{coverage}% Range": frame[f"interval_{coverage}"].astype(str),
-            "Range Width": frame[f"width_{coverage}"].map(_format_decimal),
-            "Direction Match": frame["direction_match"].map(
+            "Width": frame[f"width_{coverage}"].map(_format_decimal),
+            "Direction": frame["direction_match"].map(
                 lambda value: "Yes" if int(float(value)) == 1 else "No"
             ),
         }
@@ -318,17 +330,17 @@ def _details_table(row: pd.Series, coverage: str) -> pd.DataFrame:
         [
             {
                 "Company": str(row["ticker"]),
-                "Event Date": str(row["date"]),
+                "Date": str(row["date"]),
                 "Coverage": f"{coverage}%",
-                "Expected Return": _format_decimal(expected_return),
-                "Actual Return": _format_decimal(row.get("actual_return")),
-                "Lower Bound": _format_decimal(row.get(f"coverage_{coverage}_lower")),
-                "Upper Bound": _format_decimal(row.get(f"coverage_{coverage}_upper")),
-                "Interval Width": _format_decimal(row.get(f"width_{coverage}")),
-                "Inside Range": _interval_hit(row, coverage),
-                "Estimated EPS": _format_decimal(row.get("estimated_earnings")),
-                "Reported EPS": _format_decimal(row.get("actual_earnings")),
-                "Earnings Surprise": _format_decimal(row.get("earnings_surprise")),
+                "Expected": _format_decimal(expected_return),
+                "Actual": _format_decimal(row.get("actual_return")),
+                "Lower": _format_decimal(row.get(f"coverage_{coverage}_lower")),
+                "Upper": _format_decimal(row.get(f"coverage_{coverage}_upper")),
+                "Width": _format_decimal(row.get(f"width_{coverage}")),
+                "Inside": _interval_hit(row, coverage),
+                "Est. EPS": _format_decimal(row.get("estimated_earnings")),
+                "Rpt. EPS": _format_decimal(row.get("actual_earnings")),
+                "Surprise": _format_decimal(row.get("earnings_surprise")),
             }
         ]
     )
@@ -392,17 +404,19 @@ def build_app() -> gr.Blocks:
         selected_event = gr.Dataframe(
             label="Selected Event Summary",
             interactive=False,
+            elem_classes=["table-card"],
         )
 
-        with gr.Row():
-            history = gr.Dataframe(
-                label="Company History (`ours`)",
-                interactive=False,
-            )
-            comparison = gr.Dataframe(
-                label="Method Comparison",
-                interactive=False,
-            )
+        history = gr.Dataframe(
+            label="Company History (`ours`)",
+            interactive=False,
+            elem_classes=["table-card"],
+        )
+        comparison = gr.Dataframe(
+            label="Method Comparison",
+            interactive=False,
+            elem_classes=["table-card"],
+        )
 
         company.change(_update_dates, inputs=company, outputs=date)
         for control in (company, date, coverage):
