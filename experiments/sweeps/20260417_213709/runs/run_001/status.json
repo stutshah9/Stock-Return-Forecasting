@@ -1,0 +1,11 @@
+{
+  "run_name": "run_001",
+  "params": {
+    "lr": 5e-05,
+    "uncertainty_alignment_weight": 0.05,
+    "confidence_calibration_weight": 0.075,
+    "attention_alignment_weight": 0.075,
+    "explanation_alignment_weight": 0.05
+  },
+  "status": "running"
+}
