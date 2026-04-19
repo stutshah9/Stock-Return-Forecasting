@@ -173,11 +173,23 @@ def _message_volume(metadata: Any) -> float:
 
 
 def _confidence_score(output: dict[str, Any], metadata: Any) -> float:
-    """Extract a confidence score, preferring metadata-derived explanation confidence."""
+    """Extract a confidence score, preferring the model score and blending auxiliaries."""
 
+    model_score = None
+    if "introspective_score" in output:
+        model_score = min(max(_to_float(output.get("introspective_score", 0.5)), 0.0), 1.0)
+
+    metadata_score = None
     if isinstance(metadata, dict) and "explanation_confidence" in metadata:
-        return min(max(_to_float(metadata["explanation_confidence"]), 0.0), 1.0)
-    return min(max(_to_float(output.get("introspective_score", 0.5)), 0.0), 1.0)
+        metadata_score = min(max(_to_float(metadata["explanation_confidence"]), 0.0), 1.0)
+
+    if model_score is not None and metadata_score is not None:
+        return float(0.7 * model_score + 0.3 * metadata_score)
+    if metadata_score is not None:
+        return float(metadata_score)
+    if model_score is not None:
+        return float(model_score)
+    return 0.5
 
 
 def assign_regime(
@@ -217,18 +229,19 @@ class EventConditionedConformalPredictor:
         self,
         coverage_levels: list[float] = [0.80, 0.90, 0.95],
         minimum_bucket_size: int = 24,
+        use_attention_conditioning: bool = True,
+        use_explanation_adjustment: bool = False,
     ) -> None:
         self.coverage_levels = coverage_levels
         self.minimum_bucket_size = max(int(minimum_bucket_size), 8)
+        self.use_attention_conditioning = bool(use_attention_conditioning)
+        self.use_explanation_adjustment = bool(use_explanation_adjustment)
         self.thresholds: dict[tuple[str, float], float] = {}
         self.score_band_thresholds: dict[tuple[str, str, float], float] = {}
-        self.sigma_band_thresholds: dict[tuple[str, str, float], float] = {}
         self.attention_band_thresholds: dict[tuple[str, str, float], float] = {}
         self.global_score_band_thresholds: dict[tuple[str, float], float] = {}
-        self.global_sigma_band_thresholds: dict[tuple[str, float], float] = {}
         self.global_attention_band_thresholds: dict[tuple[str, float], float] = {}
         self.score_band_edges: dict[str, float] | None = None
-        self.sigma_band_edges: dict[str, float] | None = None
         self.attention_band_edges: dict[str, float] | None = None
 
     def calibrate(
@@ -261,15 +274,12 @@ class EventConditionedConformalPredictor:
 
         self.thresholds.clear()
         self.score_band_thresholds.clear()
-        self.sigma_band_thresholds.clear()
         self.attention_band_thresholds.clear()
         self.global_score_band_thresholds.clear()
-        self.global_sigma_band_thresholds.clear()
         self.global_attention_band_thresholds.clear()
 
         regime_scores: dict[str, list[float]] = {}
         calibration_rows: list[dict[str, float | str]] = []
-        sigma_values: list[float] = []
         confidence_values: list[float] = []
         attention_values: list[float] = []
 
@@ -291,12 +301,10 @@ class EventConditionedConformalPredictor:
                 {
                     "regime": normalized_regime,
                     "nonconformity": float(nonconformity),
-                    "sigma": float(sigma),
                     "confidence": float(confidence),
                     "message_volume": float(message_volume),
                 }
             )
-            sigma_values.append(float(sigma))
             confidence_values.append(float(confidence))
             if math.isfinite(message_volume):
                 attention_values.append(float(message_volume))
@@ -310,7 +318,6 @@ class EventConditionedConformalPredictor:
                 self.thresholds[(regime, float(coverage))] = _conformal_quantile(scores, quantile_level)
 
         self.score_band_edges = _fit_band_edges(confidence_values, 0.25, 0.75)
-        self.sigma_band_edges = _fit_band_edges(sigma_values, 0.33, 0.67)
         self.attention_band_edges = _fit_band_edges(attention_values, 0.50, 0.85)
 
         self._fit_auxiliary_thresholds(
@@ -319,13 +326,6 @@ class EventConditionedConformalPredictor:
             value_key="confidence",
             regime_store=self.score_band_thresholds,
             global_store=self.global_score_band_thresholds,
-        )
-        self._fit_auxiliary_thresholds(
-            calibration_rows=calibration_rows,
-            band_edges=self.sigma_band_edges,
-            value_key="sigma",
-            regime_store=self.sigma_band_thresholds,
-            global_store=self.global_sigma_band_thresholds,
         )
         self._fit_auxiliary_thresholds(
             calibration_rows=calibration_rows,
@@ -396,10 +396,38 @@ class EventConditionedConformalPredictor:
 
         details: dict[str, float | str] = {
             "base_regime_threshold": base_threshold,
+            "observable_threshold": base_threshold,
             "score_band": "medium",
-            "sigma_band": "medium",
             "attention_band": "medium",
+            "attention_source": "regime_only",
+            "explanation_adjusted": "no",
         }
+
+        attention_band = _assign_band(message_volume, self.attention_band_edges)
+        details["attention_band"] = attention_band
+        regime_attention_threshold = self.attention_band_thresholds.get(
+            (normalized_regime, attention_band, float(coverage))
+        )
+        global_attention_threshold = self.global_attention_band_thresholds.get(
+            (attention_band, float(coverage))
+        )
+        if regime_attention_threshold is not None:
+            regime_attention_threshold = float(regime_attention_threshold)
+            details["attention_threshold"] = regime_attention_threshold
+        elif global_attention_threshold is not None:
+            global_attention_threshold = float(global_attention_threshold)
+            details["attention_threshold"] = global_attention_threshold
+
+        observable_threshold = base_threshold
+        if self.use_attention_conditioning:
+            if regime_attention_threshold is not None:
+                observable_threshold = regime_attention_threshold
+                details["attention_source"] = "regime_attention"
+            elif global_attention_threshold is not None:
+                observable_threshold = max(base_threshold, global_attention_threshold)
+                details["attention_source"] = "global_attention_fallback"
+        details["observable_threshold"] = float(observable_threshold)
+
         score_band = _assign_band(confidence, self.score_band_edges)
         details["score_band"] = score_band
         score_threshold = self.score_band_thresholds.get((normalized_regime, score_band, float(coverage)))
@@ -409,46 +437,22 @@ class EventConditionedConformalPredictor:
             score_threshold = float(score_threshold)
             details["score_threshold"] = score_threshold
 
-        sigma_band = _assign_band(sigma, self.sigma_band_edges)
-        details["sigma_band"] = sigma_band
-        sigma_threshold = self.sigma_band_thresholds.get((normalized_regime, sigma_band, float(coverage)))
-        if sigma_threshold is None:
-            sigma_threshold = self.global_sigma_band_thresholds.get((sigma_band, float(coverage)))
-        if sigma_threshold is not None:
-            sigma_threshold = float(sigma_threshold)
-            details["sigma_threshold"] = sigma_threshold
-
-        attention_band = _assign_band(message_volume, self.attention_band_edges)
-        details["attention_band"] = attention_band
-        attention_threshold = self.attention_band_thresholds.get(
-            (normalized_regime, attention_band, float(coverage))
-        )
-        if attention_threshold is None:
-            attention_threshold = self.global_attention_band_thresholds.get(
-                (attention_band, float(coverage))
-            )
-        if attention_threshold is not None:
-            attention_threshold = float(attention_threshold)
-            details["attention_threshold"] = attention_threshold
-
-        # Explanation confidence should only widen intervals for genuinely
-        # uncertain events. The regime-conditioned conformal threshold remains
-        # the floor, so high-confidence examples cannot become under-covered
-        # just because the confidence proxy happens to be noisy.
-        combined_threshold = base_threshold
+        combined_threshold = observable_threshold
         if (
-            score_threshold is not None
+            self.use_explanation_adjustment
+            and score_threshold is not None
             and score_band == "low"
-            and score_threshold > base_threshold
+            and score_threshold > observable_threshold
         ):
             low_cut = 0.5
             if self.score_band_edges is not None:
                 low_cut = max(float(self.score_band_edges.get("low_cut", low_cut)), 1e-6)
             severity = min(max((low_cut - confidence) / low_cut, 0.0), 1.0)
             widen_weight = 0.5 + 0.5 * severity
-            combined_threshold = base_threshold + widen_weight * (
-                score_threshold - base_threshold
+            combined_threshold = observable_threshold + widen_weight * (
+                score_threshold - observable_threshold
             )
+            details["explanation_adjusted"] = "yes"
         details["combined_threshold"] = float(combined_threshold)
         return float(combined_threshold), details
 
@@ -497,16 +501,17 @@ class EventConditionedConformalPredictor:
         regime: str = "medium_surprise",
         coverage: float = 0.90,
         min_score: float = 0.6,
+        metadata: dict[str, float] | list[float] | tuple[float, ...] | None = None,
     ) -> tuple[float, float] | None:
-        introspective_score = _to_float(output["introspective_score"])
-        if introspective_score < min_score:
+        confidence = _confidence_score(output, metadata)
+        if confidence < min_score:
             return None
 
         lower, upper = self.predict_interval(
             output=output,
             regime=regime,
             coverage=coverage,
-            metadata=None,
+            metadata=metadata,
         )
         if lower <= 0.0 <= upper:
             return None

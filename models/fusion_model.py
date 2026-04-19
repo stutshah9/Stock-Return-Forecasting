@@ -161,6 +161,12 @@ class MultimodalForecastModel(nn.Module):
             nn.ReLU(),
             nn.Linear(self.embed_dim, 32),
         )
+        self.confidence_head = nn.Sequential(
+            nn.Linear(34, 32),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(32, 1),
+        )
         self._loss_debug_printed = False
 
     @classmethod
@@ -235,14 +241,19 @@ class MultimodalForecastModel(nn.Module):
 
         explanation_vec = self.explanation_head(fused_embedding)
         attention_stability = self._attention_stability_score(attention_history)
-        sigma_center = log_sigma.detach().mean()
-        sigma_scale = log_sigma.detach().std(unbiased=False).clamp(min=1e-3)
-        sigma_confidence = torch.sigmoid(-(log_sigma - sigma_center) / sigma_scale)
-        introspective_score = torch.clamp(
-            0.5 * attention_stability + 0.5 * sigma_confidence,
-            min=0.0,
-            max=1.0,
+        modality_consistency = self._modality_consistency_score(modality_tokens)
+        variance_confidence = self._variance_confidence(log_sigma)
+        confidence_inputs = torch.cat(
+            (
+                explanation_vec,
+                attention_stability.unsqueeze(-1),
+                modality_consistency.unsqueeze(-1),
+            ),
+            dim=-1,
         )
+        # Keep the introspective head separate from the Gaussian head, then
+        # explicitly regularize agreement in the loss.
+        introspective_score = torch.sigmoid(self.confidence_head(confidence_inputs)).squeeze(-1)
 
         outputs: dict[str, Any] = {
             "mu": mu,
@@ -250,6 +261,9 @@ class MultimodalForecastModel(nn.Module):
             "log_variance": log_variance,
             "variance": variance,
             "explanation_vec": explanation_vec,
+            "attention_stability": attention_stability,
+            "modality_consistency": modality_consistency,
+            "variance_confidence": variance_confidence,
             "introspective_score": introspective_score,
             "attention_weights": tuple(
                 torch.stack(layer_attention, dim=1)
@@ -288,6 +302,27 @@ class MultimodalForecastModel(nn.Module):
         ]
         mean_difference = torch.stack(layer_differences, dim=0).mean(dim=0)
         return torch.clamp(1.0 - mean_difference, min=0.0, max=1.0)
+
+    def _variance_confidence(self, log_sigma: Tensor) -> Tensor:
+        """Map lower predictive dispersion to higher confidence on a 0-1 scale."""
+
+        sigma_center = log_sigma.detach().mean()
+        sigma_scale = log_sigma.detach().std(unbiased=False).clamp(min=1e-3)
+        return torch.sigmoid(-(log_sigma - sigma_center) / sigma_scale)
+
+    def _modality_consistency_score(self, modality_tokens: Tensor) -> Tensor:
+        """Estimate cross-modality agreement from the fused token geometry."""
+
+        centered = modality_tokens - modality_tokens.mean(dim=1, keepdim=True)
+        disagreement = centered.norm(dim=-1).mean(dim=1)
+        return 1.0 / (1.0 + disagreement)
+
+    def _confidence_target(self, residual_magnitude: Tensor) -> Tensor:
+        """Convert detached residual size into a bounded confidence target."""
+
+        center = residual_magnitude.mean()
+        scale = residual_magnitude.std(unbiased=False).clamp(min=1e-3)
+        return torch.sigmoid(-(residual_magnitude - center) / scale)
 
     def _build_explanations(
         self,
@@ -347,6 +382,7 @@ class MultimodalForecastModel(nn.Module):
         dir_loss = F.binary_cross_entropy_with_logits(dir_logits, dir_target)
 
         residual_scale_target = (targets - mu).detach().abs().clamp(min=1e-4, max=1.0)
+        confidence_target = self._confidence_target(residual_scale_target)
         uncertainty_alignment_loss = F.smooth_l1_loss(
             output["log_sigma"],
             torch.log(residual_scale_target),
@@ -354,11 +390,35 @@ class MultimodalForecastModel(nn.Module):
         uncertainty_alignment_weight = float(
             self.config.get("training", {}).get("uncertainty_alignment_weight", 0.05)
         )
+        confidence_calibration_loss = F.smooth_l1_loss(
+            output["introspective_score"],
+            confidence_target,
+        )
+        confidence_calibration_weight = float(
+            self.config.get("training", {}).get("confidence_calibration_weight", 0.10)
+        )
+        attention_alignment_loss = F.smooth_l1_loss(
+            output.get("attention_stability", output["introspective_score"]),
+            output.get("variance_confidence", self._variance_confidence(output["log_sigma"])),
+        )
+        attention_alignment_weight = float(
+            self.config.get("training", {}).get("attention_alignment_weight", 0.05)
+        )
+        explanation_alignment_loss = F.smooth_l1_loss(
+            output["introspective_score"],
+            output.get("variance_confidence", self._variance_confidence(output["log_sigma"])),
+        )
+        explanation_alignment_weight = float(
+            self.config.get("training", {}).get("explanation_alignment_weight", 0.05)
+        )
 
         total_loss = (
             nll_loss
             + 0.3 * dir_loss
             + uncertainty_alignment_weight * uncertainty_alignment_loss
+            + confidence_calibration_weight * confidence_calibration_loss
+            + attention_alignment_weight * attention_alignment_loss
+            + explanation_alignment_weight * explanation_alignment_loss
         )
 
         if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
@@ -367,6 +427,18 @@ class MultimodalForecastModel(nn.Module):
             print(
                 "uncertainty_alignment_loss value: "
                 f"{uncertainty_alignment_loss.item():.6f}"
+            )
+            print(
+                "confidence_calibration_loss value: "
+                f"{confidence_calibration_loss.item():.6f}"
+            )
+            print(
+                "attention_alignment_loss value: "
+                f"{attention_alignment_loss.item():.6f}"
+            )
+            print(
+                "explanation_alignment_loss value: "
+                f"{explanation_alignment_loss.item():.6f}"
             )
             print(f"total loss: {total_loss.item():.6f}")
             print(f"fraction of mu > 0: {(mu > 0).float().mean().item():.6f}")

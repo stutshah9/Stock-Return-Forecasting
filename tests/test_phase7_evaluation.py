@@ -106,6 +106,7 @@ def main() -> None:
     subgroup_types = set(str(value) for value in subgroup_results["subgroup_type"].tolist())
     assert "surprise_band" in subgroup_types, "Missing surprise-band subgroup metrics"
     assert "volatility_band" in subgroup_types, "Missing volatility-band subgroup metrics"
+    assert "attention_volume_band" in subgroup_types, "Missing attention-volume subgroup metrics"
     assert (subgroup_results["n"] > 0).all(), "Subgroup counts must be positive"
     for cov_col in ("coverage_80", "coverage_90", "coverage_95"):
         assert (subgroup_results[cov_col] >= 0.0).all(), "Subgroup coverage must be >= 0"
@@ -117,6 +118,7 @@ def main() -> None:
         "date",
         "year",
         "actual_return",
+        "expected_return",
         "predicted_return",
         "prediction_error",
         "coverage_90_lower",

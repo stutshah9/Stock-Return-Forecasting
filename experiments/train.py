@@ -56,6 +56,7 @@ EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
 BEST_MODEL_PATH = PROJECT_ROOT / "experiments" / "model_best.pt"
+TRAINING_SUMMARY_PATH = PROJECT_ROOT / "experiments" / "training_summary.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -297,13 +298,41 @@ def _serialize_output_batch(outputs: dict[str, Tensor]) -> list[dict[str, float]
     mu_values = outputs["mu"].detach().cpu().tolist()
     log_sigma_values = outputs["log_sigma"].detach().cpu().tolist()
     score_values = outputs["introspective_score"].detach().cpu().tolist()
+    attention_values = outputs.get("attention_stability")
+    variance_values = outputs.get("variance_confidence")
+    modality_values = outputs.get("modality_consistency")
+    attention_list = (
+        attention_values.detach().cpu().tolist()
+        if attention_values is not None
+        else [0.0 for _ in mu_values]
+    )
+    variance_list = (
+        variance_values.detach().cpu().tolist()
+        if variance_values is not None
+        else [0.0 for _ in mu_values]
+    )
+    modality_list = (
+        modality_values.detach().cpu().tolist()
+        if modality_values is not None
+        else [0.0 for _ in mu_values]
+    )
 
-    for mu, log_sigma, score in zip(mu_values, log_sigma_values, score_values):
+    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
+        mu_values,
+        log_sigma_values,
+        score_values,
+        attention_list,
+        variance_list,
+        modality_list,
+    ):
         serialized.append(
             {
                 "mu": float(mu),
                 "log_sigma": float(log_sigma),
                 "introspective_score": float(score),
+                "attention_stability": float(attention),
+                "variance_confidence": float(variance_confidence),
+                "modality_consistency": float(modality_consistency),
             }
         )
     return serialized
@@ -350,6 +379,89 @@ def _regression_metrics(
     return {
         "mae": float(np.mean(np.abs(residuals))),
         "rmse": float(np.sqrt(np.mean(residuals ** 2))),
+    }
+
+
+def _confidence_target_from_residuals(residuals: np.ndarray) -> np.ndarray:
+    """Map smaller absolute residuals to higher bounded confidence targets."""
+
+    magnitudes = np.clip(np.abs(residuals), 1e-4, 1.0)
+    center = float(np.mean(magnitudes))
+    scale = max(float(np.std(magnitudes)), 1e-3)
+    return 1.0 / (1.0 + np.exp((magnitudes - center) / scale))
+
+
+def _validation_objectives(
+    outputs: list[dict[str, float]],
+    labels: list[float],
+) -> dict[str, float]:
+    """Compute a balanced validation summary for checkpoint selection."""
+
+    if not outputs or not labels:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "dir_acc": float("nan"),
+            "confidence_brier": float("nan"),
+            "variance_brier": float("nan"),
+            "selective_mae": float("nan"),
+            "proposal_score": float("inf"),
+        }
+
+    mu_values = np.asarray([float(output["mu"]) for output in outputs], dtype=float)
+    label_values = np.asarray([float(label) for label in labels], dtype=float)
+    residuals = mu_values - label_values
+    mae = float(np.mean(np.abs(residuals)))
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    dir_acc = float(np.mean(np.sign(mu_values) == np.sign(label_values)))
+
+    confidence_target = _confidence_target_from_residuals(residuals)
+    introspective_scores = np.asarray(
+        [float(output.get("introspective_score", 0.5)) for output in outputs],
+        dtype=float,
+    )
+    variance_confidences = np.asarray(
+        [
+            float(
+                output.get(
+                    "variance_confidence",
+                    1.0 / (1.0 + math.exp(float(output.get("log_sigma", 0.0)))),
+                )
+            )
+            for output in outputs
+        ],
+        dtype=float,
+    )
+    confidence_brier = float(np.mean((introspective_scores - confidence_target) ** 2))
+    variance_brier = float(np.mean((variance_confidences - confidence_target) ** 2))
+
+    selective_mask = introspective_scores >= max(float(np.median(introspective_scores)), 0.60)
+    if np.any(selective_mask):
+        selective_mae = float(np.mean(np.abs(residuals[selective_mask])))
+    else:
+        selective_mae = mae
+
+    # Lower is better. The main project objective remains reliable calibrated
+    # forecasting, but for checkpoint selection we keep point error and
+    # directionality primary and only lightly regularize the auxiliary
+    # introspection signals.
+    proposal_score = (
+        100.0 * rmse
+        + 40.0 * mae
+        + 4.0 * (1.0 - dir_acc)
+        + 1.5 * confidence_brier
+        + 1.0 * variance_brier
+        + 5.0 * selective_mae
+    )
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "dir_acc": dir_acc,
+        "confidence_brier": confidence_brier,
+        "variance_brier": variance_brier,
+        "selective_mae": selective_mae,
+        "proposal_score": float(proposal_score),
     }
 
 
@@ -474,12 +586,18 @@ def train(config_path: str) -> None:
         enabled=device.type == "cuda" and use_amp,
     )
 
-    if early_stop_metric not in {"loss", "rmse", "mae"}:
-        raise ValueError("training.early_stop_metric must be one of: loss, rmse, mae.")
+    if early_stop_metric not in {"loss", "rmse", "mae", "proposal_score"}:
+        raise ValueError(
+            "training.early_stop_metric must be one of: "
+            "loss, rmse, mae, proposal_score."
+        )
 
     best_val_score = float("inf")
+    best_epoch = 0
+    best_val_metrics: dict[str, float] = {}
     patience_counter = 0
     PATIENCE = 5
+    validation_history: list[dict[str, float | int]] = []
 
     for epoch_index in range(epochs):
         model.train()
@@ -545,14 +663,35 @@ def train(config_path: str) -> None:
                 val_outputs.extend(_serialize_output_batch(out))
                 val_labels.extend(float(value) for value in batch["labels"].cpu().tolist())
         val_loss_avg = val_loss_total / len(val_loader)
-        val_metrics = _regression_metrics(val_outputs, val_labels)
+        val_metrics = _validation_objectives(val_outputs, val_labels)
         val_rmse = float(val_metrics["rmse"])
         val_mae = float(val_metrics["mae"])
+        val_dir_acc = float(val_metrics["dir_acc"])
+        val_confidence_brier = float(val_metrics["confidence_brier"])
+        val_selective_mae = float(val_metrics["selective_mae"])
+        val_proposal_score = float(val_metrics["proposal_score"])
         print(
             "  "
             f"val_loss={val_loss_avg:.4f} "
             f"val_rmse={val_rmse:.4f} "
-            f"val_mae={val_mae:.4f}"
+            f"val_mae={val_mae:.4f} "
+            f"val_dir_acc={val_dir_acc:.4f} "
+            f"val_conf_brier={val_confidence_brier:.4f} "
+            f"val_selective_mae={val_selective_mae:.4f} "
+            f"val_proposal_score={val_proposal_score:.4f}"
+        )
+        validation_history.append(
+            {
+                "epoch": int(epoch_index + 1),
+                "train_loss": float(epoch_loss),
+                "val_loss": float(val_loss_avg),
+                "val_rmse": float(val_rmse),
+                "val_mae": float(val_mae),
+                "val_dir_acc": float(val_dir_acc),
+                "val_confidence_brier": float(val_confidence_brier),
+                "val_selective_mae": float(val_selective_mae),
+                "val_proposal_score": float(val_proposal_score),
+            }
         )
         model.train()
 
@@ -560,10 +699,21 @@ def train(config_path: str) -> None:
             "loss": val_loss_avg,
             "rmse": val_rmse,
             "mae": val_mae,
+            "proposal_score": val_proposal_score,
         }[early_stop_metric]
 
         if current_val_score < best_val_score:
             best_val_score = current_val_score
+            best_epoch = epoch_index + 1
+            best_val_metrics = {
+                "val_loss": float(val_loss_avg),
+                "val_rmse": float(val_rmse),
+                "val_mae": float(val_mae),
+                "val_dir_acc": float(val_dir_acc),
+                "val_confidence_brier": float(val_confidence_brier),
+                "val_selective_mae": float(val_selective_mae),
+                "val_proposal_score": float(val_proposal_score),
+            }
             patience_counter = 0
             torch.save(model.state_dict(), BEST_MODEL_PATH)
         else:
@@ -590,8 +740,17 @@ def train(config_path: str) -> None:
         "labels": cal_labels,
         "regimes": cal_regimes,
     }
+    training_summary = {
+        "early_stop_metric": early_stop_metric,
+        "best_val_score": float(best_val_score),
+        "best_epoch": int(best_epoch),
+        "best_metrics": best_val_metrics,
+        "history": validation_history,
+    }
     torch.save(saved_calibration, data_output_path)
     torch.save(model.state_dict(), model_output_path)
+    with TRAINING_SUMMARY_PATH.open("w", encoding="utf-8") as summary_file:
+        json.dump(training_summary, summary_file, indent=2)
 
     # Keep compatibility with existing local tests while also saving to spec paths.
     torch.save(saved_calibration, legacy_cal_output_path)

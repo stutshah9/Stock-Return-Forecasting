@@ -37,6 +37,7 @@ from models.fusion_model import MultimodalForecastModel
 EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
+FINANCIALS_PATH = PROJECT_ROOT / "data" / "financials.csv"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -133,6 +134,43 @@ def _load_feature_stats() -> dict[str, list[float]]:
     if not isinstance(stats, dict) or "mean" not in stats or "std" not in stats:
         raise ValueError("experiments/feature_stats.json is malformed.")
     return stats
+
+
+def _load_financial_lookup() -> dict[tuple[str, str], dict[str, float]]:
+    """Load per-event earnings metadata for frontend inspection exports."""
+
+    if not FINANCIALS_PATH.is_file():
+        return {}
+
+    financials = pd.read_csv(FINANCIALS_PATH)
+    required_columns = {"ticker", "date"}
+    if not required_columns.issubset(financials.columns):
+        return {}
+
+    financials["ticker"] = financials["ticker"].astype(str).str.upper()
+    financials["date"] = pd.to_datetime(financials["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    financials = financials.dropna(subset=["date"])
+
+    lookup: dict[tuple[str, str], dict[str, float]] = {}
+    for _, row in financials.iterrows():
+        key = (str(row["ticker"]).upper(), str(row["date"]))
+        lookup[key] = {
+            "estimated_earnings": _safe_numeric_row_value(row, "estimated_earnings"),
+            "actual_earnings": _safe_numeric_row_value(row, "actual_earnings"),
+            "earnings_surprise": _safe_numeric_row_value(row, "earnings_surprise"),
+        }
+    return lookup
+
+
+def _safe_numeric_row_value(row: pd.Series, column_name: str) -> float:
+    """Read a possibly-missing numeric column from a pandas row as float."""
+
+    if column_name not in row.index:
+        return float("nan")
+    value = pd.to_numeric(pd.Series([row[column_name]]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return float("nan")
+    return float(value)
 
 
 def _split_events_by_year(
@@ -314,7 +352,7 @@ def _build_explanation_metadata(
     reference_center: float | None = None,
     reference_scale: float | None = None,
 ) -> tuple[list[dict[str, float]], float, float]:
-    """Build metadata augmented with modality-disagreement explanation confidence."""
+    """Build metadata with learned confidence plus disagreement as an auxiliary cue."""
 
     if not (
         len(events)
@@ -351,16 +389,22 @@ def _build_explanation_metadata(
     scale = max(scale, 1e-6)
 
     metadata_rows: list[dict[str, float]] = []
-    for event, disagreement in zip(events, disagreements):
+    for event, disagreement, full_output in zip(events, disagreements, full_outputs):
         base_metadata = _event_calibration_metadata(event)
+        disagreement_confidence = _explanation_confidence_from_disagreement(
+            disagreement=disagreement,
+            center=center,
+            scale=scale,
+        )
+        model_confidence = float(full_output.get("introspective_score", 0.5))
         metadata_rows.append(
             {
                 **base_metadata,
                 "modality_disagreement": float(disagreement),
-                "explanation_confidence": _explanation_confidence_from_disagreement(
-                    disagreement=disagreement,
-                    center=center,
-                    scale=scale,
+                "disagreement_confidence": float(disagreement_confidence),
+                "model_confidence": model_confidence,
+                "explanation_confidence": float(
+                    min(max(0.7 * model_confidence + 0.3 * disagreement_confidence, 0.0), 1.0)
                 ),
             }
         )
@@ -501,16 +545,41 @@ def _compute_model_outputs(
         )
 
     outputs: list[dict[str, float]] = []
-    for mu, log_sigma, score in zip(
+    attention_values = batch_outputs.get("attention_stability")
+    variance_values = batch_outputs.get("variance_confidence")
+    modality_values = batch_outputs.get("modality_consistency")
+    attention_list = (
+        attention_values.cpu().tolist()
+        if attention_values is not None
+        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+    )
+    variance_list = (
+        variance_values.cpu().tolist()
+        if variance_values is not None
+        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+    )
+    modality_list = (
+        modality_values.cpu().tolist()
+        if modality_values is not None
+        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+    )
+
+    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
         batch_outputs["mu"].cpu().tolist(),
         batch_outputs["log_sigma"].cpu().tolist(),
         batch_outputs["introspective_score"].cpu().tolist(),
+        attention_list,
+        variance_list,
+        modality_list,
     ):
         outputs.append(
             {
                 "mu": float(mu),
                 "log_sigma": float(log_sigma),
                 "introspective_score": float(score),
+                "attention_stability": float(attention),
+                "variance_confidence": float(variance_confidence),
+                "modality_consistency": float(modality_consistency),
             }
         )
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
@@ -613,6 +682,46 @@ def _regime_components(regime: str) -> tuple[str, str]:
     return normalized_regime, "unknown_vol"
 
 
+def _attention_volume_bands(
+    metadata: list[dict[str, float]] | None,
+) -> list[str]:
+    """Partition message volume into coarse low/medium/high attention bands."""
+
+    if metadata is None or not metadata:
+        return []
+
+    values: list[float] = []
+    for row in metadata:
+        value = float(row.get("message_volume", 0.0))
+        if math.isfinite(value):
+            values.append(value)
+
+    if len(values) < 3:
+        return ["medium_attention" for _ in metadata]
+
+    values_array = np.asarray(values, dtype=float)
+    if float(np.max(values_array) - np.min(values_array)) <= 1e-8:
+        return ["medium_attention" for _ in metadata]
+
+    low_cut = float(np.quantile(values_array, 0.33))
+    high_cut = float(np.quantile(values_array, 0.67))
+    if high_cut <= low_cut:
+        return ["medium_attention" for _ in metadata]
+
+    bands: list[str] = []
+    for row in metadata:
+        value = float(row.get("message_volume", 0.0))
+        if not math.isfinite(value):
+            bands.append("medium_attention")
+        elif value < low_cut:
+            bands.append("low_attention")
+        elif value < high_cut:
+            bands.append("medium_attention")
+        else:
+            bands.append("high_attention")
+    return bands
+
+
 def _metric_row(
     method: str,
     outputs: list[dict[str, float]],
@@ -658,7 +767,7 @@ def _metric_row(
 
     for output, label, regime, event_metadata in zip(outputs, labels, regimes, metadata):
         for coverage in coverages:
-            if mode == "ours":
+            if mode == "adaptive":
                 try:
                     lower, upper = predictor.predict_interval(
                         output=output,
@@ -725,6 +834,9 @@ def _subgroup_metric_rows(
     rows: list[dict[str, float | str | int]] = []
     if metadata is None:
         metadata = [{} for _ in outputs]
+    attention_bands = _attention_volume_bands(metadata)
+    for index, band_name in enumerate(attention_bands):
+        subgroup_members.setdefault(("attention_volume_band", band_name), []).append(index)
     for (subgroup_type, subgroup_name), indices in sorted(subgroup_members.items()):
         subgroup_outputs = [outputs[index] for index in indices]
         subgroup_labels = [labels[index] for index in indices]
@@ -758,12 +870,15 @@ def _prediction_rows(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    financial_lookup: dict[tuple[str, str], dict[str, float]] | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Build per-event prediction rows for export and lightweight inspection."""
 
     rows: list[dict[str, float | str | int]] = []
     if metadata is None:
         metadata = [_event_calibration_metadata(event) for event in events]
+    if financial_lookup is None:
+        financial_lookup = {}
 
     for event, output, label, regime, ticker, event_metadata in zip(
         events,
@@ -775,7 +890,7 @@ def _prediction_rows(
     ):
         interval_bounds: dict[float, tuple[float, float]] = {}
         for coverage in (0.80, 0.90, 0.95):
-            if mode == "ours":
+            if mode == "adaptive":
                 lower, upper = predictor.predict_interval(
                     output=output,
                     regime=regime,
@@ -802,6 +917,10 @@ def _prediction_rows(
         feature_values = _feature_triplet(event)
         mu = float(output["mu"])
         sigma = float(math.exp(float(output["log_sigma"])))
+        financial_metadata = financial_lookup.get(
+            (str(ticker).upper(), str(event.get("date", ""))),
+            {},
+        )
         rows.append(
             {
                 "method": method,
@@ -810,7 +929,9 @@ def _prediction_rows(
                 "year": int(event.get("year", 0)),
                 "regime": regime,
                 "actual_return": float(label),
+                "expected_return": mu,
                 "predicted_return": mu,
+                "actual_minus_expected": float(label) - mu,
                 "prediction_error": mu - float(label),
                 "sigma": sigma,
                 "introspective_score": float(output.get("introspective_score", 0.0)),
@@ -826,6 +947,15 @@ def _prediction_rows(
                 "coverage_95_upper": interval_bounds[0.95][1],
                 "interval_95": f"[{interval_bounds[0.95][0]:.4f}, {interval_bounds[0.95][1]:.4f}]",
                 "width_95": float(interval_bounds[0.95][1] - interval_bounds[0.95][0]),
+                "estimated_earnings": float(
+                    financial_metadata.get("estimated_earnings", float("nan"))
+                ),
+                "actual_earnings": float(
+                    financial_metadata.get("actual_earnings", float("nan"))
+                ),
+                "earnings_surprise": float(
+                    financial_metadata.get("earnings_surprise", float("nan"))
+                ),
                 "sue": float(feature_values[0]),
                 "momentum": float(feature_values[1]),
                 "implied_vol": float(feature_values[2]),
@@ -854,20 +984,26 @@ def _selective_metric_rows(
     predictor: EventConditionedConformalPredictor,
     min_scores: list[float],
     coverage: float = 0.90,
+    metadata: list[dict[str, float]] | None = None,
 ) -> list[dict[str, float | str]]:
     """Compute a lightweight selective prediction risk-coverage table."""
 
     rows: list[dict[str, float | str]] = []
+    if metadata is None:
+        metadata = [{} for _ in outputs]
     for min_score in min_scores:
         kept_indices: list[int] = []
         interval_widths: list[float] = []
         interval_hits: list[float] = []
-        for index, (output, label, regime) in enumerate(zip(outputs, labels, regimes)):
+        for index, (output, label, regime, event_metadata) in enumerate(
+            zip(outputs, labels, regimes, metadata)
+        ):
             interval = predictor.selective_predict(
                 output=output,
                 regime=regime,
                 coverage=coverage,
                 min_score=min_score,
+                metadata=event_metadata,
             )
             if interval is None:
                 continue
@@ -949,6 +1085,7 @@ def evaluate(config_path: str) -> None:
     regime_thresholds = _load_regime_thresholds(config, train_events + val_events)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
+    financial_lookup = _load_financial_lookup()
 
     device = _select_device(config)
     print(f"Using device: {device}")
@@ -1007,7 +1144,16 @@ def evaluate(config_path: str) -> None:
     )
 
     coverage_levels = list(config.get("calibration", {}).get("coverage_levels", [0.80, 0.90, 0.95]))
-    predictor = EventConditionedConformalPredictor(coverage_levels=coverage_levels)
+    event_conditioned_predictor = EventConditionedConformalPredictor(
+        coverage_levels=coverage_levels,
+        use_attention_conditioning=True,
+        use_explanation_adjustment=False,
+    )
+    explanation_augmented_predictor = EventConditionedConformalPredictor(
+        coverage_levels=coverage_levels,
+        use_attention_conditioning=True,
+        use_explanation_adjustment=True,
+    )
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1015,7 +1161,13 @@ def evaluate(config_path: str) -> None:
         financial_outputs=cal_financial_outputs,
         sentiment_outputs=cal_sentiment_outputs,
     )
-    predictor.calibrate(
+    event_conditioned_predictor.calibrate(
+        cal_outputs=cal_outputs,
+        cal_labels=cal_labels,
+        cal_regimes=cal_regimes,
+        cal_metadata=cal_metadata,
+    )
+    explanation_augmented_predictor.calibrate(
         cal_outputs=cal_outputs,
         cal_labels=cal_labels,
         cal_regimes=cal_regimes,
@@ -1032,15 +1184,20 @@ def evaluate(config_path: str) -> None:
         config.get("evaluation", {}).get("include_selective_analysis", False)
     )
 
-    for method, mode in (
-        ("text_only", "regime_no_introspection"),
-        ("financial_only", "regime_no_introspection"),
-        ("sentiment_only", "regime_no_introspection"),
-        ("full_multimodal", "regime_no_introspection"),
-        ("naive_conformal", "naive"),
-        ("ours", "ours"),
-    ):
+    evaluation_specs: list[tuple[str, str, EventConditionedConformalPredictor]] = [
+        ("text_only", "regime_no_introspection", event_conditioned_predictor),
+        ("financial_only", "regime_no_introspection", event_conditioned_predictor),
+        ("sentiment_only", "regime_no_introspection", event_conditioned_predictor),
+        ("full_multimodal", "regime_no_introspection", event_conditioned_predictor),
+        ("naive_conformal", "naive", event_conditioned_predictor),
+        ("ours", "adaptive", event_conditioned_predictor),
+        ("ours_explanation_augmented", "adaptive", explanation_augmented_predictor),
+    ]
+
+    for method, mode, _active_predictor in evaluation_specs:
         base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
+        if method == "ours_explanation_augmented":
+            base_method = "full_multimodal"
         outputs, labels, regimes, _tickers = _compute_model_outputs(
             model=model,
             events=test_events,
@@ -1082,27 +1239,11 @@ def evaluate(config_path: str) -> None:
         "full_multimodal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "naive_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "ours": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "ours_explanation_augmented": (test_full_outputs, test_labels, test_regimes, test_tickers),
     }
 
-    for method, mode in (
-        ("text_only", "regime_no_introspection"),
-        ("financial_only", "regime_no_introspection"),
-        ("sentiment_only", "regime_no_introspection"),
-        ("full_multimodal", "regime_no_introspection"),
-        ("naive_conformal", "naive"),
-        ("ours", "ours"),
-    ):
+    for method, mode, active_predictor in evaluation_specs:
         outputs, labels, regimes, _tickers = method_payloads[method]
-        if method == "ours":
-            for output, event_metadata in zip(outputs, test_metadata):
-                output["introspective_score"] = float(
-                    event_metadata.get("explanation_confidence", output.get("introspective_score", 0.5))
-                )
-        elif method in {"full_multimodal", "naive_conformal"}:
-            for output, event_metadata in zip(outputs, test_metadata):
-                output["introspective_score"] = float(
-                    event_metadata.get("explanation_confidence", output.get("introspective_score", 0.5))
-                )
 
         results_rows.append(
             _metric_row(
@@ -1110,7 +1251,7 @@ def evaluate(config_path: str) -> None:
                 outputs=outputs,
                 labels=labels,
                 regimes=regimes,
-                predictor=predictor,
+                predictor=active_predictor,
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
@@ -1124,19 +1265,20 @@ def evaluate(config_path: str) -> None:
                 labels=labels,
                 regimes=regimes,
                 tickers=_tickers,
-                predictor=predictor,
+                predictor=active_predictor,
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
+                financial_lookup=financial_lookup,
             )
         )
-        if include_selective_analysis and method == "ours":
+        if include_selective_analysis and method == "ours_explanation_augmented":
             selective_rows.extend(
                 _selective_metric_rows(
                     outputs=outputs,
                     labels=labels,
                     regimes=regimes,
-                    predictor=predictor,
+                    predictor=active_predictor,
                     min_scores=[
                         float(score)
                         for score in config.get("calibration", {}).get(
@@ -1144,6 +1286,7 @@ def evaluate(config_path: str) -> None:
                             [0.55, 0.70, 0.85],
                         )
                     ],
+                    metadata=test_metadata,
                 )
             )
         subgroup_rows.extend(
@@ -1152,7 +1295,7 @@ def evaluate(config_path: str) -> None:
                 outputs=outputs,
                 labels=labels,
                 regimes=regimes,
-                predictor=predictor,
+                predictor=active_predictor,
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
@@ -1170,7 +1313,7 @@ def evaluate(config_path: str) -> None:
             outputs=baseline_outputs,
             labels=baseline_labels,
             regimes=baseline_regimes,
-            predictor=predictor,
+            predictor=event_conditioned_predictor,
             global_thresholds=global_thresholds,
             mode="naive",
         )
@@ -1183,9 +1326,10 @@ def evaluate(config_path: str) -> None:
             labels=baseline_labels,
             regimes=baseline_regimes,
             tickers=_baseline_tickers,
-            predictor=predictor,
+            predictor=event_conditioned_predictor,
             global_thresholds=global_thresholds,
             mode="naive",
+            financial_lookup=financial_lookup,
         )
     )
     subgroup_rows.extend(
@@ -1194,7 +1338,7 @@ def evaluate(config_path: str) -> None:
             outputs=baseline_outputs,
             labels=baseline_labels,
             regimes=baseline_regimes,
-            predictor=predictor,
+            predictor=event_conditioned_predictor,
             global_thresholds=global_thresholds,
             mode="naive",
         )

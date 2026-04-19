@@ -26,6 +26,10 @@ def main() -> None:
     random.seed(42)
 
     predictor = EventConditionedConformalPredictor(coverage_levels=[0.80, 0.90, 0.95])
+    explanation_predictor = EventConditionedConformalPredictor(
+        coverage_levels=[0.80, 0.90, 0.95],
+        use_explanation_adjustment=True,
+    )
 
     outputs = _sample_outputs(90)
     labels = [random.uniform(-0.10, 0.10) for _ in range(90)]
@@ -37,11 +41,26 @@ def main() -> None:
         + (["high_surprise_low_vol"] * 15)
         + (["high_surprise_high_vol"] * 15)
     )
+    metadata = []
+    for index in range(90):
+        metadata.append(
+            {
+                "message_volume": float(index % 30),
+                "explanation_confidence": 0.15 if index % 2 == 0 else 0.85,
+            }
+        )
 
     predictor.calibrate(
         cal_outputs=outputs,
         cal_labels=labels,
         cal_regimes=regimes,
+        cal_metadata=metadata,
+    )
+    explanation_predictor.calibrate(
+        cal_outputs=outputs,
+        cal_labels=labels,
+        cal_regimes=regimes,
+        cal_metadata=metadata,
     )
 
     required_keys = [
@@ -82,11 +101,13 @@ def main() -> None:
         low_score_out,
         regime="medium_surprise_low_vol",
         coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.10},
     )
     lo_high, hi_high = predictor.predict_interval(
         high_score_out,
         regime="medium_surprise_low_vol",
         coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.90},
     )
     width_low = hi_low - lo_low
     width_high = hi_high - lo_high
@@ -95,19 +116,41 @@ def main() -> None:
         low_score_out,
         regime="medium_surprise_low_vol",
         coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.10},
     )
     diagnostics_high = predictor.interval_diagnostics(
         high_score_out,
         regime="medium_surprise_low_vol",
         coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.90},
     )
     assert "combined_threshold" in diagnostics_low, "Missing combined conformal threshold"
     assert "score_band" in diagnostics_low, "Missing score band diagnostics"
-    assert "sigma_band" in diagnostics_low, "Missing sigma band diagnostics"
+    assert "attention_band" in diagnostics_low, "Missing attention band diagnostics"
+    assert diagnostics_low["attention_source"] in {
+        "regime_only",
+        "regime_attention",
+        "global_attention_fallback",
+    }, "Missing observable attention conditioning source"
     assert (
-        diagnostics_low["combined_threshold"] != diagnostics_high["combined_threshold"]
-        or diagnostics_low["score_band"] != diagnostics_high["score_band"]
-    ), "Confidence-conditioned calibration should react to score differences"
+        diagnostics_low["combined_threshold"] == diagnostics_high["combined_threshold"]
+    ), "Default event-conditioned calibration should not change interval width solely from explanation score"
+
+    exp_lo_low, exp_hi_low = explanation_predictor.predict_interval(
+        low_score_out,
+        regime="medium_surprise_low_vol",
+        coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.10},
+    )
+    exp_lo_high, exp_hi_high = explanation_predictor.predict_interval(
+        high_score_out,
+        regime="medium_surprise_low_vol",
+        coverage=0.90,
+        metadata={"message_volume": 1.0, "explanation_confidence": 0.90},
+    )
+    assert (
+        (exp_hi_low - exp_lo_low) >= (exp_hi_high - exp_lo_high)
+    ), "Explanation-augmented ablation should widen low-confidence intervals when enabled"
 
     lo95, hi95 = predictor.predict_interval(
         high_score_out,

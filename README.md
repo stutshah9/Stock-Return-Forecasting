@@ -209,6 +209,7 @@ This evaluates:
 - `full_multimodal`
 - `naive_conformal`
 - `ours`
+- `ours_explanation_augmented`
 - `same_ticker_baseline`
 
 The script prints a results table with:
@@ -221,7 +222,8 @@ The script prints a results table with:
 - `RMSE`
 - `dir_acc`
 
-It also saves subgroup-stratified metrics by surprise band and volatility regime to:
+It also saves subgroup-stratified metrics by surprise band, volatility regime,
+and attention-volume band to:
 
 ```text
 experiments/results_by_subgroup.csv
@@ -260,6 +262,31 @@ python3 experiments/show_prediction_examples.py --year 2025 --ticker AAPL --date
 python3 experiments/show_prediction_examples.py --method all --year 2025 --ticker MSFT --limit 20
 ```
 
+## Hyperparameter Sweep
+
+To search for the strongest overall checkpoint under the proposal-style
+validation objective instead of manually comparing runs:
+
+```bash
+cd /Users/Stuti/Stock-Return-Forecasting
+python3 experiments/sweep.py
+```
+
+This sweep:
+
+- perturbs learning rate plus the uncertainty/confidence alignment weights
+- trains and evaluates each candidate config
+- saves per-run configs, logs, and CSV outputs under `experiments/sweeps/...`
+- ranks runs by validation `proposal_score`
+- reruns the selected best config and saves its final artifacts under
+  `experiments/sweeps/.../best/`
+
+On Falcon, submit the sweep with:
+
+```bash
+sbatch scripts/falcon_sweep.sbatch
+```
+
 For a simple local frontend after evaluation:
 
 ```bash
@@ -267,9 +294,19 @@ python3 -m pip install gradio
 python3 frontend/prediction_viewer.py
 ```
 
-Then open the local URL Gradio prints and pick the year, method, ticker, and
-date to inspect predicted vs real return values and the calibrated intervals for
-all methods side-by-side.
+Then open the local URL Gradio prints and pick a company ticker plus event date.
+The viewer now centers the proposal-style `ours` calibration and shows:
+
+- the calibrated 80/90/95 percent return range for the selected company event
+- the model's expected return and the actual realized return
+- whether the realized return landed inside the calibrated interval
+- the reported-vs-estimated earnings values when they exist in `data/financials.csv`
+- a side-by-side method comparison table for the same event
+
+In the current evaluation code, `ours` is the main event-conditioned conformal
+method based on observable event features, while
+`ours_explanation_augmented` is kept as a lighter ablation that optionally
+widens intervals when the model's auxiliary confidence score is low.
 
 ## Mass Train And Test
 
