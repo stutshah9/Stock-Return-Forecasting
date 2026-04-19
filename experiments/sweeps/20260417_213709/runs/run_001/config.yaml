@@ -1,0 +1,46 @@
+data:
+  min_chunk_size: 256
+  max_chunk_size: 512
+  chunk_size: 256
+  max_chunks: 16
+  universe: sp500
+  split:
+    strategy: year
+    validation_years:
+    - 2023
+    calibration_years:
+    - 2024
+    test_years:
+    - 2025
+    allow_synthetic_fallback: false
+model:
+  embed_dim: 64
+  dropout: 0.1
+training:
+  device: cuda
+  seed: 42
+  lr: 5.0e-05
+  batch_size: 32
+  epochs: 30
+  use_amp: true
+  grad_clip_norm: 1.0
+  early_stop_metric: proposal_score
+  uncertainty_alignment_weight: 0.05
+  confidence_calibration_weight: 0.075
+  attention_alignment_weight: 0.075
+  explanation_alignment_weight: 0.05
+calibration:
+  coverage_levels:
+  - 0.8
+  - 0.9
+  - 0.95
+  regime_fit_quantiles:
+    low_surprise: 0.6
+    high_surprise: 0.9
+    high_vol: 0.6
+  selective_min_scores:
+  - 0.55
+  - 0.7
+  - 0.85
+evaluation:
+  include_selective_analysis: false

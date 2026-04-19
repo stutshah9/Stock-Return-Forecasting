@@ -1,0 +1,27 @@
+{
+  "base_config": "/home/stutishah9/earnings_forecast/config.yaml",
+  "selection_metric": "best_val_proposal_score",
+  "grid": {
+    "lr": [
+      3e-05,
+      5e-05,
+      7e-05
+    ],
+    "uncertainty_alignment_weight": [
+      0.05
+    ],
+    "confidence_calibration_weight": [
+      0.075,
+      0.15
+    ],
+    "attention_alignment_weight": [
+      0.025,
+      0.075
+    ],
+    "explanation_alignment_weight": [
+      0.025,
+      0.05
+    ]
+  },
+  "run_count": 24
+}
