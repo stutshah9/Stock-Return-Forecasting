@@ -1,6 +1,3 @@
-# regularize by the confidence of the explantions produced by the LLM
-# explanation augmented confomral score/ ground truth - prediction / variance * confidence from the LLM
-
 """Event-conditioned conformal calibration utilities."""
 
 from __future__ import annotations
@@ -194,6 +191,35 @@ def _confidence_score(output: dict[str, Any], metadata: Any) -> float:
     return 0.5
 
 
+def _interval_bounds(
+    output: dict[str, Any],
+    coverage: float | None = None,
+) -> tuple[float, float]:
+    """Read an ordered prediction interval from a model output dictionary."""
+
+    if coverage is not None and isinstance(output.get("base_intervals"), dict):
+        base_intervals = output["base_intervals"]
+        interval = base_intervals.get(float(coverage), base_intervals.get(str(float(coverage))))
+        if interval is not None:
+            lower = _to_float(interval["lower"])
+            upper = _to_float(interval["upper"])
+            if upper < lower:
+                lower, upper = upper, lower
+            return float(lower), float(upper)
+
+    if "q_low" in output and "q_high" in output:
+        lower = _to_float(output["q_low"])
+        upper = _to_float(output["q_high"])
+        if upper < lower:
+            lower, upper = upper, lower
+        return float(lower), float(upper)
+
+    mu = _to_float(output["mu"])
+    log_sigma = _to_float(output.get("log_sigma", 0.0))
+    half_width = math.exp(log_sigma)
+    return float(mu - half_width), float(mu + half_width)
+
+
 def assign_regime(
     sue: float,
     implied_vol: float = 0.0,
@@ -237,13 +263,9 @@ class EventConditionedConformalPredictor:
         self.coverage_levels = coverage_levels
         self.minimum_bucket_size = max(int(minimum_bucket_size), 8)
         self.use_attention_conditioning = bool(use_attention_conditioning)
-        self.use_explanation_adjustment = bool(use_explanation_adjustment)
         self.thresholds: dict[tuple[str, float], float] = {}
-        self.score_band_thresholds: dict[tuple[str, str, float], float] = {}
         self.attention_band_thresholds: dict[tuple[str, str, float], float] = {}
-        self.global_score_band_thresholds: dict[tuple[str, float], float] = {}
         self.global_attention_band_thresholds: dict[tuple[str, float], float] = {}
-        self.score_band_edges: dict[str, float] | None = None
         self.attention_band_edges: dict[str, float] | None = None
 
     def calibrate(
@@ -275,14 +297,11 @@ class EventConditionedConformalPredictor:
             raise ValueError("Calibration metadata must align with calibration outputs.")
 
         self.thresholds.clear()
-        self.score_band_thresholds.clear()
         self.attention_band_thresholds.clear()
-        self.global_score_band_thresholds.clear()
         self.global_attention_band_thresholds.clear()
 
-        regime_scores: dict[str, list[float]] = {}
+        regime_scores: dict[tuple[str, float], list[float]] = {}
         calibration_rows: list[dict[str, float | str]] = []
-        confidence_values: list[float] = []
         attention_values: list[float] = []
 
         for output, label, regime, metadata in zip(
@@ -292,43 +311,30 @@ class EventConditionedConformalPredictor:
             cal_metadata,
         ):
             normalized_regime = _normalize_regime(regime)
-            mu = _to_float(output["mu"])
-            log_sigma = _to_float(output["log_sigma"])
-            sigma = max(math.exp(log_sigma), 1e-6)
-            nonconformity = abs(float(label) - mu) / sigma
-            confidence = _confidence_score(output, metadata)
             message_volume = _message_volume(metadata)
-            regime_scores.setdefault(normalized_regime, []).append(nonconformity)
-            calibration_rows.append(
-                {
-                    "regime": normalized_regime,
-                    "nonconformity": float(nonconformity),
-                    "confidence": float(confidence),
-                    "message_volume": float(message_volume),
-                }
-            )
-            confidence_values.append(float(confidence))
             if math.isfinite(message_volume):
                 attention_values.append(float(message_volume))
+            for coverage in self.coverage_levels:
+                q_low, q_high = _interval_bounds(output, coverage=float(coverage))
+                nonconformity = max(q_low - float(label), float(label) - q_high)
+                regime_scores.setdefault((normalized_regime, float(coverage)), []).append(nonconformity)
+                calibration_rows.append(
+                    {
+                        "regime": normalized_regime,
+                        "coverage": float(coverage),
+                        "nonconformity": float(nonconformity),
+                        "message_volume": float(message_volume),
+                    }
+                )
 
-        for regime, scores in regime_scores.items():
+        for (regime, coverage), scores in regime_scores.items():
             n = len(scores)
             if n == 0:
                 continue
-            for coverage in self.coverage_levels:
-                quantile_level = coverage * (1.0 + 1.0 / n)
-                self.thresholds[(regime, float(coverage))] = _conformal_quantile(scores, quantile_level)
+            quantile_level = coverage * (1.0 + 1.0 / n)
+            self.thresholds[(regime, float(coverage))] = _conformal_quantile(scores, quantile_level)
 
-        self.score_band_edges = _fit_band_edges(confidence_values, 0.25, 0.75)
         self.attention_band_edges = _fit_band_edges(attention_values, 0.50, 0.85)
-
-        self._fit_auxiliary_thresholds(
-            calibration_rows=calibration_rows,
-            band_edges=self.score_band_edges,
-            value_key="confidence",
-            regime_store=self.score_band_thresholds,
-            global_store=self.global_score_band_thresholds,
-        )
         self._fit_auxiliary_thresholds(
             calibration_rows=calibration_rows,
             band_edges=self.attention_band_edges,
@@ -354,28 +360,27 @@ class EventConditionedConformalPredictor:
             band = _assign_band(float(row[value_key]), band_edges)
             nonconformity = float(row["nonconformity"])
             regime = str(row["regime"])
-            band_scores_by_regime.setdefault((regime, band), []).append(nonconformity)
-            global_band_scores.setdefault(band, []).append(nonconformity)
+            coverage = float(row["coverage"])
+            band_scores_by_regime.setdefault((regime, band, coverage), []).append(nonconformity)
+            global_band_scores.setdefault((band, coverage), []).append(nonconformity)
 
-        for (regime, band), scores in band_scores_by_regime.items():
+        for (regime, band, coverage), scores in band_scores_by_regime.items():
             if len(scores) < self.minimum_bucket_size:
                 continue
-            for coverage in self.coverage_levels:
-                quantile_level = coverage * (1.0 + 1.0 / len(scores))
-                regime_store[(regime, band, float(coverage))] = _conformal_quantile(
-                    scores,
-                    quantile_level,
-                )
+            quantile_level = coverage * (1.0 + 1.0 / len(scores))
+            regime_store[(regime, band, float(coverage))] = _conformal_quantile(
+                scores,
+                quantile_level,
+            )
 
-        for band, scores in global_band_scores.items():
+        for (band, coverage), scores in global_band_scores.items():
             if len(scores) < self.minimum_bucket_size:
                 continue
-            for coverage in self.coverage_levels:
-                quantile_level = coverage * (1.0 + 1.0 / len(scores))
-                global_store[(band, float(coverage))] = _conformal_quantile(
-                    scores,
-                    quantile_level,
-                )
+            quantile_level = coverage * (1.0 + 1.0 / len(scores))
+            global_store[(band, float(coverage))] = _conformal_quantile(
+                scores,
+                quantile_level,
+            )
 
     def _combined_threshold(
         self,
@@ -392,17 +397,13 @@ class EventConditionedConformalPredictor:
             )
 
         base_threshold = float(self.thresholds[threshold_key])
-        sigma = max(math.exp(_to_float(output["log_sigma"])), 1e-6)
-        confidence = _confidence_score(output, metadata)
         message_volume = _message_volume(metadata)
 
         details: dict[str, float | str] = {
             "base_regime_threshold": base_threshold,
             "observable_threshold": base_threshold,
-            "score_band": "medium",
             "attention_band": "medium",
             "attention_source": "regime_only",
-            "explanation_adjusted": "no",
         }
 
         attention_band = _assign_band(message_volume, self.attention_band_edges)
@@ -423,40 +424,15 @@ class EventConditionedConformalPredictor:
         observable_threshold = base_threshold
         if self.use_attention_conditioning:
             if regime_attention_threshold is not None:
-                observable_threshold = regime_attention_threshold
+                observable_threshold = max(base_threshold, regime_attention_threshold)
                 details["attention_source"] = "regime_attention"
             elif global_attention_threshold is not None:
                 observable_threshold = max(base_threshold, global_attention_threshold)
                 details["attention_source"] = "global_attention_fallback"
+        observable_threshold = max(float(observable_threshold), 0.0)
         details["observable_threshold"] = float(observable_threshold)
-
-        score_band = _assign_band(confidence, self.score_band_edges)
-        details["score_band"] = score_band
-        score_threshold = self.score_band_thresholds.get((normalized_regime, score_band, float(coverage)))
-        if score_threshold is None:
-            score_threshold = self.global_score_band_thresholds.get((score_band, float(coverage)))
-        if score_threshold is not None:
-            score_threshold = float(score_threshold)
-            details["score_threshold"] = score_threshold
-
-        combined_threshold = observable_threshold
-        if (
-            self.use_explanation_adjustment
-            and score_threshold is not None
-            and score_band == "low"
-            and score_threshold > observable_threshold
-        ):
-            low_cut = 0.5
-            if self.score_band_edges is not None:
-                low_cut = max(float(self.score_band_edges.get("low_cut", low_cut)), 1e-6)
-            severity = min(max((low_cut - confidence) / low_cut, 0.0), 1.0)
-            widen_weight = 0.5 + 0.5 * severity
-            combined_threshold = observable_threshold + widen_weight * (
-                score_threshold - observable_threshold
-            )
-            details["explanation_adjusted"] = "yes"
-        details["combined_threshold"] = float(combined_threshold)
-        return float(combined_threshold), details
+        details["combined_threshold"] = float(observable_threshold)
+        return float(observable_threshold), details
 
     def predict_interval(
         self,
@@ -466,16 +442,14 @@ class EventConditionedConformalPredictor:
         metadata: dict[str, float] | list[float] | tuple[float, ...] | None = None,
     ) -> tuple[float, float]:
         normalized_regime = _normalize_regime(regime)
-        mu = _to_float(output["mu"])
-        log_sigma = _to_float(output["log_sigma"])
+        base_lower, base_upper = _interval_bounds(output, coverage=float(coverage))
         threshold, _details = self._combined_threshold(
             normalized_regime=normalized_regime,
             coverage=coverage,
             output=output,
             metadata=metadata,
         )
-        half_width = threshold * math.exp(log_sigma)
-        return mu - half_width, mu + half_width
+        return base_lower - threshold, base_upper + threshold
 
     def interval_diagnostics(
         self,
@@ -491,8 +465,9 @@ class EventConditionedConformalPredictor:
             output=output,
             metadata=metadata,
         )
-        sigma = max(math.exp(_to_float(output["log_sigma"])), 1e-6)
-        details["effective_half_width"] = float(threshold * sigma)
+        base_lower, base_upper = _interval_bounds(output, coverage=float(coverage))
+        details["base_interval_width"] = float(base_upper - base_lower)
+        details["effective_interval_width"] = float((base_upper - base_lower) + 2.0 * threshold)
         details["coverage"] = float(coverage)
         details["regime"] = normalized_regime
         return details

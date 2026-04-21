@@ -371,10 +371,10 @@ def _build_explanation_metadata(
         sentiment_outputs,
     ):
         mu_values = [
-            float(text_output["mu"]),
-            float(financial_output["mu"]),
-            float(sentiment_output["mu"]),
-            float(full_output["mu"]),
+            _point_prediction_for_method(text_output, "text_only"),
+            _point_prediction_for_method(financial_output, "financial_only"),
+            _point_prediction_for_method(sentiment_output, "sentiment_only"),
+            _point_prediction_for_method(full_output, "full_multimodal"),
         ]
         disagreements.append(float(np.std(np.asarray(mu_values, dtype=float), ddof=0)))
 
@@ -420,6 +420,50 @@ def _to_float(value: Any) -> float:
         return float(value)
 
 
+def _point_prediction_for_method(
+    output: dict[str, Any],
+    method: str,
+) -> float:
+    """Select the point forecast used for a given evaluation method."""
+
+    if method == "naive_conformal":
+        return _to_float(output.get("quantile_median", output["mu"]))
+    return _to_float(output.get("point_mu", output["mu"]))
+
+
+def _output_interval_bounds(output: dict[str, Any]) -> tuple[float, float]:
+    """Read an ordered interval from serialized model outputs."""
+
+    if "q_low" in output and "q_high" in output:
+        lower = float(output["q_low"])
+        upper = float(output["q_high"])
+        if upper < lower:
+            lower, upper = upper, lower
+        return lower, upper
+
+    mu = _to_float(output["mu"])
+    sigma = math.exp(_to_float(output.get("log_sigma", 0.0)))
+    return float(mu - sigma), float(mu + sigma)
+
+
+def _output_interval_bounds_for_coverage(
+    output: dict[str, Any],
+    coverage: float,
+) -> tuple[float, float]:
+    """Read the base interval matching a target nominal coverage."""
+
+    base_intervals = output.get("base_intervals")
+    if isinstance(base_intervals, dict):
+        interval = base_intervals.get(float(coverage), base_intervals.get(str(float(coverage))))
+        if interval is not None:
+            lower = float(interval["lower"])
+            upper = float(interval["upper"])
+            if upper < lower:
+                lower, upper = upper, lower
+            return lower, upper
+    return _output_interval_bounds(output)
+
+
 def _conformal_quantile(scores: list[float], quantile_level: float) -> float:
     """Compute a conservative quantile for conformal calibration."""
 
@@ -436,13 +480,12 @@ def _build_global_thresholds(
     cal_labels: list[float],
     coverage_levels: list[float],
 ) -> dict[float, float]:
-    """Build global non-regime thresholds for a naive conformal baseline."""
+    """Build global absolute-error thresholds for a naive conformal baseline."""
 
     scores: list[float] = []
     for output, label in zip(cal_outputs, cal_labels):
-        mu = _to_float(output["mu"])
-        log_sigma = _to_float(output["log_sigma"])
-        scores.append(abs(float(label) - mu) / math.exp(log_sigma))
+        mu = _point_prediction_for_method(output, "naive_conformal")
+        scores.append(abs(float(label) - mu))
 
     thresholds: dict[float, float] = {}
     n = len(scores)
@@ -545,40 +588,73 @@ def _compute_model_outputs(
         )
 
     outputs: list[dict[str, float]] = []
+    quantile_levels = [float(value) for value in batch_outputs["quantile_levels"].cpu().tolist()]
+    quantile_predictions = batch_outputs["quantile_predictions"].cpu().tolist()
+    base_intervals_raw = batch_outputs.get("base_intervals", {})
     attention_values = batch_outputs.get("attention_stability")
-    variance_values = batch_outputs.get("variance_confidence")
+    interval_confidence_values = batch_outputs.get("interval_confidence")
     modality_values = batch_outputs.get("modality_consistency")
     attention_list = (
         attention_values.cpu().tolist()
         if attention_values is not None
-        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+        else [0.0 for _ in batch_outputs["q_low"].cpu().tolist()]
     )
-    variance_list = (
-        variance_values.cpu().tolist()
-        if variance_values is not None
-        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+    interval_confidence_list = (
+        interval_confidence_values.cpu().tolist()
+        if interval_confidence_values is not None
+        else [0.0 for _ in batch_outputs["q_low"].cpu().tolist()]
     )
     modality_list = (
         modality_values.cpu().tolist()
         if modality_values is not None
-        else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
+        else [0.0 for _ in batch_outputs["q_low"].cpu().tolist()]
     )
 
-    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
+    for index, (
+        q_low,
+        q_high,
+        mu,
+        point_mu,
+        quantile_median,
+        score,
+        attention,
+        interval_confidence,
+        modality_consistency,
+    ) in enumerate(zip(
+        batch_outputs["q_low"].cpu().tolist(),
+        batch_outputs["q_high"].cpu().tolist(),
         batch_outputs["mu"].cpu().tolist(),
-        batch_outputs["log_sigma"].cpu().tolist(),
+        batch_outputs.get("point_mu", batch_outputs["mu"]).cpu().tolist(),
+        batch_outputs.get("quantile_median", batch_outputs["mu"]).cpu().tolist(),
         batch_outputs["introspective_score"].cpu().tolist(),
         attention_list,
-        variance_list,
+        interval_confidence_list,
         modality_list,
-    ):
+    )):
+        per_output_quantiles = {
+            level: float(prediction)
+            for level, prediction in zip(quantile_levels, quantile_predictions[index])
+        }
+        base_intervals = {
+            float(coverage): {
+                "lower": float(interval_pair[0][index].detach().cpu().item()),
+                "upper": float(interval_pair[1][index].detach().cpu().item()),
+            }
+            for coverage, interval_pair in base_intervals_raw.items()
+        }
         outputs.append(
             {
+                "quantiles": per_output_quantiles,
+                "base_intervals": base_intervals,
+                "q_low": float(q_low),
+                "q_high": float(q_high),
                 "mu": float(mu),
-                "log_sigma": float(log_sigma),
+                "point_mu": float(point_mu),
+                "quantile_median": float(quantile_median),
                 "introspective_score": float(score),
                 "attention_stability": float(attention),
-                "variance_confidence": float(variance_confidence),
+                "interval_confidence": float(interval_confidence),
+                "variance_confidence": float(interval_confidence),
                 "modality_consistency": float(modality_consistency),
             }
         )
@@ -623,8 +699,10 @@ def _compute_same_ticker_baseline(
         mu, sigma = _same_ticker_baseline_parameters(ticker, training_events)
         outputs.append(
             {
+                "base_intervals": {},
+                "q_low": float(mu - sigma),
+                "q_high": float(mu + sigma),
                 "mu": float(mu),
-                "log_sigma": float(math.log(max(sigma, 1e-6))),
                 "introspective_score": 1.0,
             }
         )
@@ -646,16 +724,10 @@ def _predict_interval_without_adjustment(
     regime: str,
     coverage: float,
 ) -> tuple[float, float]:
-    """Predict a regime-aware interval without introspective widening."""
+    """Return the model's raw quantile interval before conformal expansion."""
 
-    normalized_regime = regime
-    threshold = predictor.thresholds.get((normalized_regime, float(coverage)))
-    if threshold is None:
-        threshold = _fallback_threshold(predictor, coverage)
-    mu = _to_float(output["mu"])
-    sigma = math.exp(_to_float(output["log_sigma"]))
-    half_width = threshold * sigma
-    return mu - half_width, mu + half_width
+    del predictor, regime
+    return _output_interval_bounds_for_coverage(output, coverage)
 
 
 def _predict_interval_naive(
@@ -663,12 +735,11 @@ def _predict_interval_naive(
     coverage: float,
     global_thresholds: dict[float, float],
 ) -> tuple[float, float]:
-    """Predict a global conformal interval without introspective widening."""
+    """Predict a symmetric globally conformalized interval around the point forecast."""
 
-    mu = _to_float(output["mu"])
-    sigma = math.exp(_to_float(output["log_sigma"]))
-    half_width = global_thresholds[float(coverage)] * sigma
-    return mu - half_width, mu + half_width
+    mu = _point_prediction_for_method(output, "naive_conformal")
+    threshold = global_thresholds[float(coverage)]
+    return mu - threshold, mu + threshold
 
 
 def _regime_components(regime: str) -> tuple[str, str]:
@@ -738,7 +809,7 @@ def _metric_row(
     interval_hits: dict[float, list[float]] = {coverage: [] for coverage in coverages}
     interval_widths: dict[float, list[float]] = {coverage: [] for coverage in coverages}
 
-    mu_values = [float(output["mu"]) for output in outputs]
+    mu_values = [_point_prediction_for_method(output, method) for output in outputs]
     mae = float(np.mean([abs(mu - y) for mu, y in zip(mu_values, labels)]))
     rmse = float(np.sqrt(np.mean([(mu - y) ** 2 for mu, y in zip(mu_values, labels)])))
     if method == "same_ticker_baseline":
@@ -777,10 +848,8 @@ def _metric_row(
                     )
                 except KeyError:
                     threshold = _fallback_threshold(predictor, coverage)
-                    mu = _to_float(output["mu"])
-                    sigma = math.exp(_to_float(output["log_sigma"]))
-                    half_width = threshold * sigma
-                    lower, upper = mu - half_width, mu + half_width
+                    base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
+                    lower, upper = base_lower - threshold, base_upper + threshold
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
             else:
@@ -915,8 +984,7 @@ def _prediction_rows(
         transcript_text = str(event.get("transcript", "") or "")
         transcript_preview = transcript_text[:240].replace("\n", " ").strip()
         feature_values = _feature_triplet(event)
-        mu = float(output["mu"])
-        sigma = float(math.exp(float(output["log_sigma"])))
+        mu = _point_prediction_for_method(output, method)
         financial_metadata = financial_lookup.get(
             (str(ticker).upper(), str(event.get("date", ""))),
             {},
@@ -933,7 +1001,18 @@ def _prediction_rows(
                 "predicted_return": mu,
                 "actual_minus_expected": float(label) - mu,
                 "prediction_error": mu - float(label),
-                "sigma": sigma,
+                "predicted_q_low": float(output.get("q_low", mu)),
+                "predicted_q_high": float(output.get("q_high", mu)),
+                "base_interval_width": float(
+                    output.get(
+                        "q_high",
+                        mu,
+                    )
+                    - output.get(
+                        "q_low",
+                        mu,
+                    )
+                ),
                 "introspective_score": float(output.get("introspective_score", 0.0)),
                 "coverage_80_lower": interval_bounds[0.80][0],
                 "coverage_80_upper": interval_bounds[0.80][1],
@@ -1029,7 +1108,7 @@ def _selective_metric_rows(
 
         kept_outputs = [outputs[index] for index in kept_indices]
         kept_labels = [labels[index] for index in kept_indices]
-        mu_values = [float(output["mu"]) for output in kept_outputs]
+        mu_values = [_point_prediction_for_method(output, "ours") for output in kept_outputs]
         rows.append(
             {
                 "method": "ours_selective",
@@ -1149,11 +1228,6 @@ def evaluate(config_path: str) -> None:
         use_attention_conditioning=True,
         use_explanation_adjustment=False,
     )
-    explanation_augmented_predictor = EventConditionedConformalPredictor(
-        coverage_levels=coverage_levels,
-        use_attention_conditioning=True,
-        use_explanation_adjustment=True,
-    )
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1162,12 +1236,6 @@ def evaluate(config_path: str) -> None:
         sentiment_outputs=cal_sentiment_outputs,
     )
     event_conditioned_predictor.calibrate(
-        cal_outputs=cal_outputs,
-        cal_labels=cal_labels,
-        cal_regimes=cal_regimes,
-        cal_metadata=cal_metadata,
-    )
-    explanation_augmented_predictor.calibrate(
         cal_outputs=cal_outputs,
         cal_labels=cal_labels,
         cal_regimes=cal_regimes,
@@ -1185,19 +1253,16 @@ def evaluate(config_path: str) -> None:
     )
 
     evaluation_specs: list[tuple[str, str, EventConditionedConformalPredictor]] = [
-        ("text_only", "regime_no_introspection", event_conditioned_predictor),
-        ("financial_only", "regime_no_introspection", event_conditioned_predictor),
-        ("sentiment_only", "regime_no_introspection", event_conditioned_predictor),
-        ("full_multimodal", "regime_no_introspection", event_conditioned_predictor),
+        ("text_only", "raw_quantile", event_conditioned_predictor),
+        ("financial_only", "raw_quantile", event_conditioned_predictor),
+        ("sentiment_only", "raw_quantile", event_conditioned_predictor),
+        ("full_multimodal", "raw_quantile", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
         ("ours", "adaptive", event_conditioned_predictor),
-        ("ours_explanation_augmented", "adaptive", explanation_augmented_predictor),
     ]
 
     for method, mode, _active_predictor in evaluation_specs:
         base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
-        if method == "ours_explanation_augmented":
-            base_method = "full_multimodal"
         outputs, labels, regimes, _tickers = _compute_model_outputs(
             model=model,
             events=test_events,
@@ -1239,7 +1304,6 @@ def evaluate(config_path: str) -> None:
         "full_multimodal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "naive_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "ours": (test_full_outputs, test_labels, test_regimes, test_tickers),
-        "ours_explanation_augmented": (test_full_outputs, test_labels, test_regimes, test_tickers),
     }
 
     for method, mode, active_predictor in evaluation_specs:
@@ -1272,7 +1336,7 @@ def evaluate(config_path: str) -> None:
                 financial_lookup=financial_lookup,
             )
         )
-        if include_selective_analysis and method == "ours_explanation_augmented":
+        if include_selective_analysis and method == "ours":
             selective_rows.extend(
                 _selective_metric_rows(
                     outputs=outputs,

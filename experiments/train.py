@@ -14,10 +14,31 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
+
+try:
+    from torch.amp import GradScaler as TorchGradScaler
+    from torch.amp import autocast as torch_autocast
+
+    def _make_grad_scaler(device_type: str, enabled: bool) -> TorchGradScaler:
+        return TorchGradScaler(device_type, enabled=enabled)
+
+    def _autocast(device_type: str, enabled: bool):
+        return torch_autocast(device_type=device_type, enabled=enabled)
+
+except ImportError:  # pragma: no cover - older torch fallback
+    from torch.cuda.amp import GradScaler as TorchGradScaler
+    from torch.cuda.amp import autocast as torch_autocast
+
+    def _make_grad_scaler(device_type: str, enabled: bool) -> TorchGradScaler:
+        del device_type
+        return TorchGradScaler(enabled=enabled)
+
+    def _autocast(device_type: str, enabled: bool):
+        del device_type
+        return torch_autocast(enabled=enabled)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +61,7 @@ EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
 BEST_MODEL_PATH = PROJECT_ROOT / "experiments" / "model_best.pt"
+TRAINING_SUMMARY_PATH = PROJECT_ROOT / "experiments" / "training_summary.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -278,20 +300,26 @@ def _serialize_output_batch(outputs: dict[str, Tensor]) -> list[dict[str, float]
     """Convert batched model outputs into a list of Python dictionaries."""
 
     serialized: list[dict[str, float]] = []
+    quantile_levels = [float(value) for value in outputs["quantile_levels"].detach().cpu().tolist()]
+    quantile_predictions = outputs["quantile_predictions"].detach().cpu().tolist()
+    base_intervals_raw = outputs.get("base_intervals", {})
+    q_low_values = outputs["q_low"].detach().cpu().tolist()
+    q_high_values = outputs["q_high"].detach().cpu().tolist()
     mu_values = outputs["mu"].detach().cpu().tolist()
-    log_sigma_values = outputs["log_sigma"].detach().cpu().tolist()
+    point_mu_values = outputs.get("point_mu", outputs["mu"]).detach().cpu().tolist()
+    quantile_median_values = outputs.get("quantile_median", outputs["mu"]).detach().cpu().tolist()
     score_values = outputs["introspective_score"].detach().cpu().tolist()
     attention_values = outputs.get("attention_stability")
-    variance_values = outputs.get("variance_confidence")
+    interval_confidence_values = outputs.get("interval_confidence")
     modality_values = outputs.get("modality_consistency")
     attention_list = (
         attention_values.detach().cpu().tolist()
         if attention_values is not None
         else [0.0 for _ in mu_values]
     )
-    variance_list = (
-        variance_values.detach().cpu().tolist()
-        if variance_values is not None
+    interval_confidence_list = (
+        interval_confidence_values.detach().cpu().tolist()
+        if interval_confidence_values is not None
         else [0.0 for _ in mu_values]
     )
     modality_list = (
@@ -300,21 +328,51 @@ def _serialize_output_batch(outputs: dict[str, Tensor]) -> list[dict[str, float]
         else [0.0 for _ in mu_values]
     )
 
-    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
+    for index, (
+        q_low,
+        q_high,
+        mu,
+        point_mu,
+        quantile_median,
+        score,
+        attention,
+        interval_confidence,
+        modality_consistency,
+    ) in enumerate(zip(
+        q_low_values,
+        q_high_values,
         mu_values,
-        log_sigma_values,
+        point_mu_values,
+        quantile_median_values,
         score_values,
         attention_list,
-        variance_list,
+        interval_confidence_list,
         modality_list,
-    ):
+    )):
+        per_output_quantiles = {
+            level: float(prediction)
+            for level, prediction in zip(quantile_levels, quantile_predictions[index])
+        }
+        base_intervals = {
+            float(coverage): {
+                "lower": float(interval_pair[0][index].detach().cpu().item()),
+                "upper": float(interval_pair[1][index].detach().cpu().item()),
+            }
+            for coverage, interval_pair in base_intervals_raw.items()
+        }
         serialized.append(
             {
+                "quantiles": per_output_quantiles,
+                "base_intervals": base_intervals,
+                "q_low": float(q_low),
+                "q_high": float(q_high),
                 "mu": float(mu),
-                "log_sigma": float(log_sigma),
+                "point_mu": float(point_mu),
+                "quantile_median": float(quantile_median),
                 "introspective_score": float(score),
                 "attention_stability": float(attention),
-                "variance_confidence": float(variance_confidence),
+                "interval_confidence": float(interval_confidence),
+                "variance_confidence": float(interval_confidence),
                 "modality_consistency": float(modality_consistency),
             }
         )
@@ -364,14 +422,14 @@ def train(config_path: str) -> None:
     seed = int(training_config.get("seed", 42))
     use_amp = bool(training_config.get("use_amp", True))
     grad_clip_norm = float(training_config.get("grad_clip_norm", 1.0))
-    use_pinball_loss = bool(training_config.get("use_pinball_loss", True))
+    early_stop_metric = str(training_config.get("early_stop_metric", "val_rmse"))
     pinball_quantiles = [
         float(value)
-        for value in training_config.get("pinball_quantiles", [0.10, 0.50, 0.90])
+        for value in training_config.get("pinball_quantiles", [0.10, 0.90])
         if 0.0 < float(value) < 1.0
     ]
-    if not pinball_quantiles:
-        pinball_quantiles = [0.50]
+    if len(pinball_quantiles) < 2:
+        pinball_quantiles = [0.10, 0.90]
 
     _set_seed(seed)
 
@@ -400,11 +458,8 @@ def train(config_path: str) -> None:
 
     device = _select_device(config)
     tqdm.write(f"Using device: {device}")
-    if use_pinball_loss:
-        quantile_text = ", ".join(f"{quantile:.2f}" for quantile in pinball_quantiles)
-        tqdm.write(f"Regression loss: pinball quantile loss [{quantile_text}]")
-    else:
-        tqdm.write("Regression loss: Gaussian negative log-likelihood")
+    quantile_text = ", ".join(f"{quantile:.2f}" for quantile in pinball_quantiles)
+    tqdm.write(f"Regression loss: pinball quantile loss [{quantile_text}]")
     if device.type == "cuda":
         tqdm.write(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
@@ -475,11 +530,17 @@ def train(config_path: str) -> None:
         lr=float(training_config.get("lr", 1e-4)),
         weight_decay=1e-4,
     )
-    scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
+    scaler = _make_grad_scaler(
+        device_type=device.type,
+        enabled=device.type == "cuda" and use_amp,
+    )
 
-    best_val_loss = float("inf")
+    best_val_score = float("inf")
+    best_epoch = 0
+    best_val_metrics: dict[str, float] = {}
     patience_counter = 0
     PATIENCE = 5
+    validation_history: list[dict[str, float | int]] = []
 
     for epoch_index in range(epochs):
         model.train()
@@ -498,7 +559,7 @@ def train(config_path: str) -> None:
             batch = _move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=device.type == "cuda" and use_amp):
+            with _autocast(device_type=device.type, enabled=device.type == "cuda" and use_amp):
                 outputs = model(
                     transcripts=batch["transcripts"],
                     financial=batch["financial"],
@@ -524,22 +585,51 @@ def train(config_path: str) -> None:
 
         model.eval()
         val_loss_total = 0.0
+        val_predictions: list[float] = []
+        val_labels: list[float] = []
         with torch.no_grad():
             for batch in val_loader:
                 batch = _move_batch_to_device(batch, device)
-                with autocast(enabled=device.type == "cuda" and use_amp):
+                with _autocast(device_type=device.type, enabled=device.type == "cuda" and use_amp):
                     out = model(
                         transcripts=batch["transcripts"],
                         financial=batch["financial"],
                         sentiment=batch["sentiment"],
                     )
                     val_loss_total += model.loss(out, batch["labels"]).item()
+                val_predictions.extend(float(value) for value in out["mu"].detach().cpu().tolist())
+                val_labels.extend(float(value) for value in batch["labels"].detach().cpu().tolist())
         val_loss_avg = val_loss_total / len(val_loader)
-        print(f"  val_loss={val_loss_avg:.4f}")
+        val_mae = float(np.mean([abs(pred - label) for pred, label in zip(val_predictions, val_labels)]))
+        val_rmse = float(
+            np.sqrt(np.mean([(pred - label) ** 2 for pred, label in zip(val_predictions, val_labels)]))
+        )
+        print(f"  val_loss={val_loss_avg:.4f} val_mae={val_mae:.4f} val_rmse={val_rmse:.4f}")
+        validation_history.append(
+            {
+                "epoch": int(epoch_index + 1),
+                "train_loss": float(epoch_loss),
+                "val_loss": float(val_loss_avg),
+                "val_mae": float(val_mae),
+                "val_rmse": float(val_rmse),
+            }
+        )
         model.train()
 
-        if val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
+        current_score = {
+            "val_loss": float(val_loss_avg),
+            "val_mae": float(val_mae),
+            "val_rmse": float(val_rmse),
+        }.get(early_stop_metric, float(val_rmse))
+
+        if current_score < best_val_score:
+            best_val_score = current_score
+            best_epoch = epoch_index + 1
+            best_val_metrics = {
+                "val_loss": float(val_loss_avg),
+                "val_mae": float(val_mae),
+                "val_rmse": float(val_rmse),
+            }
             patience_counter = 0
             torch.save(model.state_dict(), BEST_MODEL_PATH)
         else:
@@ -566,8 +656,17 @@ def train(config_path: str) -> None:
         "labels": cal_labels,
         "regimes": cal_regimes,
     }
+    training_summary = {
+        "early_stop_metric": early_stop_metric,
+        "best_val_score": float(best_val_score),
+        "best_epoch": int(best_epoch),
+        "best_metrics": best_val_metrics,
+        "history": validation_history,
+    }
     torch.save(saved_calibration, data_output_path)
     torch.save(model.state_dict(), model_output_path)
+    with TRAINING_SUMMARY_PATH.open("w", encoding="utf-8") as summary_file:
+        json.dump(training_summary, summary_file, indent=2)
 
     # Keep compatibility with existing local tests while also saving to spec paths.
     torch.save(saved_calibration, legacy_cal_output_path)

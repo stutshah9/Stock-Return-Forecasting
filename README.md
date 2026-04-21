@@ -209,7 +209,6 @@ This evaluates:
 - `full_multimodal`
 - `naive_conformal`
 - `ours`
-- `ours_explanation_augmented`
 - `same_ticker_baseline`
 
 The script prints a results table with:
@@ -303,10 +302,9 @@ The viewer now centers the proposal-style `ours` calibration and shows:
 - the reported-vs-estimated earnings values when they exist in `data/financials.csv`
 - a side-by-side method comparison table for the same event
 
-In the current evaluation code, `ours` is the main event-conditioned conformal
-method based on observable event features, while
-`ours_explanation_augmented` is kept as a lighter ablation that optionally
-widens intervals when the model's auxiliary confidence score is low.
+In the current evaluation code, `ours` is the main conformalized quantile
+regression method: the model predicts lower and upper return quantiles, then a
+held-out calibration split expands those intervals with conformal thresholds.
 
 ## Mass Train And Test
 
@@ -451,7 +449,7 @@ rsync -avh --progress /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
-srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=02:00:00      --gres=gpu:l40s:1      --pty bash -l
+srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:l40s:1      --pty bash -l
 source .venv/bin/activate
 cd earnings_forecast/
 python3 experiments/train.py

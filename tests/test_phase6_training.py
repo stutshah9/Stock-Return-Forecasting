@@ -64,8 +64,11 @@ def main() -> None:
 
     for output in outputs:
         assert isinstance(output, dict), "each output must be a dictionary"
+        assert "q_low" in output, "output missing q_low"
+        assert "q_high" in output, "output missing q_high"
         assert "mu" in output, "output missing mu"
-        assert "log_sigma" in output, "output missing log_sigma"
+        assert "point_mu" in output, "output missing point_mu"
+        assert "quantile_median" in output, "output missing quantile_median"
         assert "introspective_score" in output, "output missing introspective_score"
 
     assert os.path.isfile(training_summary_path), "training_summary.json must exist after training dry-run"

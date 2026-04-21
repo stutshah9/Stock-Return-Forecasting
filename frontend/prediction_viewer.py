@@ -20,7 +20,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OURS_METHOD = "ours"
 METHOD_ORDER = [
     "ours",
-    "ours_explanation_augmented",
     "naive_conformal",
     "full_multimodal",
     "text_only",
@@ -170,7 +169,6 @@ def _format_method_name(value: object) -> str:
     method = str(value)
     mapping = {
         "ours": "Ours",
-        "ours_explanation_augmented": "Ours + Explanation",
         "naive_conformal": "Naive Conformal",
         "full_multimodal": "Full Multimodal",
         "text_only": "Text Only",

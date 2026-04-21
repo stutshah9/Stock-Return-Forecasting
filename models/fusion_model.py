@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 import sys
@@ -88,7 +87,7 @@ class CrossModalFusionLayer(nn.Module):
 
 
 class MultimodalForecastModel(nn.Module):
-    """Fuse transcript, financial, and sentiment inputs for Gaussian forecasting."""
+    """Fuse transcript, financial, and sentiment inputs for quantile forecasting."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialize the multimodal fusion model from a configuration dictionary.
@@ -106,6 +105,9 @@ class MultimodalForecastModel(nn.Module):
         self.embed_dim = int(model_config.get("embed_dim", 64))
         self.dropout = float(model_config.get("dropout", 0.1))
         self.text_frozen = bool(model_config.get("text_frozen", True))
+        self.quantile_levels = self._configured_quantile_levels(config)
+        self.coverage_quantile_pairs = self._coverage_quantile_pairs(config, self.quantile_levels)
+        self.default_interval_coverage = self._default_interval_coverage(self.coverage_quantile_pairs)
         cache_dir = data_config.get("cache_dir")
         if cache_dir is None and self.text_frozen:
             cache_dir = str(Path(__file__).resolve().parents[1] / "data" / "transcript_cache")
@@ -155,7 +157,8 @@ class MultimodalForecastModel(nn.Module):
             ]
         )
         self.fusion_norm = nn.LayerNorm(self.embed_dim)
-        self.gaussian_head = nn.Linear(self.embed_dim, 2)
+        self.quantile_head = nn.Linear(self.embed_dim, len(self.quantile_levels))
+        self.point_head = nn.Linear(self.embed_dim, 1)
         self.explanation_head = nn.Sequential(
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.ReLU(),
@@ -170,13 +173,82 @@ class MultimodalForecastModel(nn.Module):
         self._loss_debug_printed = False
 
     @staticmethod
-    def _normal_quantile(quantiles: Tensor) -> Tensor:
-        """Map quantile levels in ``(0, 1)`` to standard normal z-scores."""
+    def _configured_quantile_levels(config: dict[str, Any]) -> tuple[float, ...]:
+        """Return the sorted quantile levels used by the prediction head."""
 
-        clamped = quantiles.clamp(min=1e-6, max=1.0 - 1e-6)
-        return torch.sqrt(torch.tensor(2.0, device=clamped.device, dtype=clamped.dtype)) * torch.special.erfinv(
-            2.0 * clamped - 1.0
+        training_config = config.get("training", {})
+        quantiles = sorted(
+            {
+                float(value)
+                for value in training_config.get(
+                    "pinball_quantiles",
+                    [0.025, 0.05, 0.10, 0.50, 0.90, 0.95, 0.975],
+                )
+                if 0.0 < float(value) < 1.0
+            }
         )
+        if 0.50 not in quantiles:
+            quantiles.append(0.50)
+            quantiles.sort()
+        return tuple(float(value) for value in quantiles)
+
+    @staticmethod
+    def _coverage_quantile_pairs(
+        config: dict[str, Any],
+        quantile_levels: tuple[float, ...],
+    ) -> dict[float, tuple[float, float]]:
+        """Match each requested coverage level to its lower/upper quantile pair."""
+
+        calibration_config = config.get("calibration", {})
+        coverages = [
+            float(value)
+            for value in calibration_config.get("coverage_levels", [0.80, 0.90, 0.95])
+            if 0.0 < float(value) < 1.0
+        ]
+        if not coverages:
+            coverages = [0.80, 0.90, 0.95]
+
+        level_set = set(quantile_levels)
+        pairs: dict[float, tuple[float, float]] = {}
+        for coverage in coverages:
+            alpha = 1.0 - coverage
+            lower = round(alpha / 2.0, 6)
+            upper = round(1.0 - alpha / 2.0, 6)
+            if lower not in level_set or upper not in level_set:
+                raise ValueError(
+                    "pinball_quantiles must include matching lower/upper levels "
+                    f"for calibration coverage {coverage:.2f}. "
+                    f"Missing pair ({lower}, {upper})."
+                )
+            pairs[float(coverage)] = (float(lower), float(upper))
+        return pairs
+
+    @staticmethod
+    def _default_interval_coverage(
+        coverage_quantile_pairs: dict[float, tuple[float, float]],
+    ) -> float:
+        """Choose the primary interval coverage used for confidence features."""
+
+        if 0.90 in coverage_quantile_pairs:
+            return 0.90
+        return sorted(coverage_quantile_pairs.keys())[len(coverage_quantile_pairs) // 2]
+
+    def _default_interval_quantiles(self) -> tuple[float, float]:
+        """Return the default interval pair used for diagnostics and confidence heads."""
+
+        return self.coverage_quantile_pairs[self.default_interval_coverage]
+
+    def _base_interval_from_predictions(
+        self,
+        quantile_predictions: Tensor,
+        lower_quantile: float,
+        upper_quantile: float,
+    ) -> tuple[Tensor, Tensor]:
+        """Select the predicted lower and upper bounds for a target coverage level."""
+
+        lower_index = self.quantile_levels.index(lower_quantile)
+        upper_index = self.quantile_levels.index(upper_quantile)
+        return quantile_predictions[:, lower_index], quantile_predictions[:, upper_index]
 
     @classmethod
     def load_from_config(cls, config_path: str) -> MultimodalForecastModel:
@@ -212,7 +284,7 @@ class MultimodalForecastModel(nn.Module):
                 explanation strings in the returned dictionary.
 
         Returns:
-            A dictionary with Gaussian parameters, attention-derived confidence,
+            A dictionary with interval quantiles, attention-derived confidence,
             explanation features, and optional natural-language explanations.
         """
 
@@ -224,7 +296,7 @@ class MultimodalForecastModel(nn.Module):
         if sentiment is None:
             raise ValueError("Sentiment inputs are required.")
 
-        device = self.gaussian_head.weight.device
+        device = self.quantile_head.weight.device
         financial = financial.to(device=device, dtype=torch.float32)
         sentiment = sentiment.to(device=device, dtype=torch.float32)
 
@@ -242,16 +314,32 @@ class MultimodalForecastModel(nn.Module):
             attention_history.append(layer_attention)
         fused_embedding = self.fusion_norm(modality_tokens.mean(dim=1))
 
-        gaussian_params = self.gaussian_head(fused_embedding)
-        mu = gaussian_params[:, 0]
-        log_variance = torch.clamp(gaussian_params[:, 1], min=-6.0, max=6.0)
-        variance = torch.exp(log_variance)
-        log_sigma = 0.5 * log_variance
+        quantile_params = self.quantile_head(fused_embedding)
+        quantile_predictions, _ = torch.sort(quantile_params, dim=-1)
+        median_index = self.quantile_levels.index(0.50)
+        quantile_median = quantile_predictions[:, median_index]
+        point_mu = self.point_head(fused_embedding).squeeze(-1)
+        mu = point_mu
+        default_lower_quantile, default_upper_quantile = self._default_interval_quantiles()
+        q_low, q_high = self._base_interval_from_predictions(
+            quantile_predictions,
+            default_lower_quantile,
+            default_upper_quantile,
+        )
+        interval_width = q_high - q_low
+        base_intervals = {
+            float(coverage): self._base_interval_from_predictions(
+                quantile_predictions,
+                lower_quantile,
+                upper_quantile,
+            )
+            for coverage, (lower_quantile, upper_quantile) in self.coverage_quantile_pairs.items()
+        }
 
         explanation_vec = self.explanation_head(fused_embedding)
         attention_stability = self._attention_stability_score(attention_history)
         modality_consistency = self._modality_consistency_score(modality_tokens)
-        variance_confidence = self._variance_confidence(log_sigma)
+        interval_confidence = self._interval_confidence(interval_width)
         confidence_inputs = torch.cat(
             (
                 explanation_vec,
@@ -265,14 +353,24 @@ class MultimodalForecastModel(nn.Module):
         introspective_score = torch.sigmoid(self.confidence_head(confidence_inputs)).squeeze(-1)
 
         outputs: dict[str, Any] = {
+            "quantile_levels": torch.tensor(
+                self.quantile_levels,
+                device=quantile_predictions.device,
+                dtype=quantile_predictions.dtype,
+            ),
+            "quantile_predictions": quantile_predictions,
+            "base_intervals": base_intervals,
+            "q_low": q_low,
+            "q_high": q_high,
             "mu": mu,
-            "log_sigma": log_sigma,
-            "log_variance": log_variance,
-            "variance": variance,
+            "point_mu": point_mu,
+            "quantile_median": quantile_median,
+            "interval_width": interval_width,
             "explanation_vec": explanation_vec,
             "attention_stability": attention_stability,
             "modality_consistency": modality_consistency,
-            "variance_confidence": variance_confidence,
+            "interval_confidence": interval_confidence,
+            "variance_confidence": interval_confidence,
             "introspective_score": introspective_score,
             "attention_weights": tuple(
                 torch.stack(layer_attention, dim=1)
@@ -282,7 +380,7 @@ class MultimodalForecastModel(nn.Module):
         if return_explanations:
             outputs["explanations"] = self._build_explanations(
                 mu=mu,
-                variance=variance,
+                interval_width=interval_width,
                 modality_tokens=modality_tokens,
             )
         return outputs
@@ -312,12 +410,12 @@ class MultimodalForecastModel(nn.Module):
         mean_difference = torch.stack(layer_differences, dim=0).mean(dim=0)
         return torch.clamp(1.0 - mean_difference, min=0.0, max=1.0)
 
-    def _variance_confidence(self, log_sigma: Tensor) -> Tensor:
-        """Map lower predictive dispersion to higher confidence on a 0-1 scale."""
+    def _interval_confidence(self, interval_width: Tensor) -> Tensor:
+        """Map narrower predictive intervals to higher confidence on a 0-1 scale."""
 
-        sigma_center = log_sigma.detach().mean()
-        sigma_scale = log_sigma.detach().std(unbiased=False).clamp(min=1e-3)
-        return torch.sigmoid(-(log_sigma - sigma_center) / sigma_scale)
+        width_center = interval_width.detach().mean()
+        width_scale = interval_width.detach().std(unbiased=False).clamp(min=1e-3)
+        return torch.sigmoid(-(interval_width - width_center) / width_scale)
 
     def _modality_consistency_score(self, modality_tokens: Tensor) -> Tensor:
         """Estimate cross-modality agreement from the fused token geometry."""
@@ -336,7 +434,7 @@ class MultimodalForecastModel(nn.Module):
     def _build_explanations(
         self,
         mu: Tensor,
-        variance: Tensor,
+        interval_width: Tensor,
         modality_tokens: Tensor,
     ) -> list[str]:
         """Generate lightweight natural-language forecast explanations."""
@@ -348,7 +446,7 @@ class MultimodalForecastModel(nn.Module):
         for index in range(mu.shape[0]):
             dominant_index = int(modality_strength[index].argmax().item())
             direction = "positive" if float(mu[index].item()) >= 0.0 else "negative"
-            uncertainty = "elevated" if float(variance[index].item()) > 1.0 else "moderate"
+            uncertainty = "elevated" if float(interval_width[index].item()) > 0.10 else "moderate"
             explanations.append(
                 "The model forecasts a "
                 f"{direction} next-day return with {uncertainty} uncertainty, "
@@ -359,7 +457,7 @@ class MultimodalForecastModel(nn.Module):
         return explanations
 
     def loss(self, output: dict[str, Any], y: Tensor) -> Tensor:
-        """Compute pinball quantile loss plus directional/confidence regularizers.
+        """Compute pinball quantile loss with optional auxiliary regularizers.
 
         Args:
             output: Model outputs from ``forward``.
@@ -369,83 +467,111 @@ class MultimodalForecastModel(nn.Module):
             A scalar combined training loss.
         """
 
-        mu = output["mu"]
-        log_variance = output.get("log_variance")
-        if log_variance is None:
-            log_variance = 2.0 * output["log_sigma"]
-        variance = output.get("variance")
-        if variance is None:
-            variance = torch.exp(log_variance)
-        sigma = torch.sqrt(variance.clamp(min=1e-12))
+        q_low = output["q_low"]
+        q_high = output["q_high"]
+        mu = output.get("mu")
+        if mu is None:
+            mu = 0.5 * (q_low + q_high)
+        quantile_median = output.get("quantile_median")
+        if quantile_median is None:
+            quantile_median = mu
+        interval_width = output.get("interval_width")
+        if interval_width is None:
+            interval_width = (q_high - q_low).clamp(min=1e-6)
         targets = y.to(device=mu.device, dtype=torch.float32).view(-1)
 
-        training_config = self.config.get("training", {})
-        quantiles_raw = training_config.get("pinball_quantiles", [0.10, 0.50, 0.90])
-        quantiles = [float(value) for value in quantiles_raw]
-        valid_quantiles = [value for value in quantiles if 0.0 < value < 1.0]
-        if not valid_quantiles:
-            valid_quantiles = [0.50]
-        quantile_tensor = torch.tensor(
-            valid_quantiles,
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        z_scores = self._normal_quantile(quantile_tensor)
-        quantile_predictions = mu.unsqueeze(-1) + sigma.unsqueeze(-1) * z_scores.unsqueeze(0)
+        quantile_levels = output.get("quantile_levels")
+        quantile_predictions = output.get("quantile_predictions")
+        if quantile_levels is None or quantile_predictions is None:
+            default_lower_quantile, default_upper_quantile = self._default_interval_quantiles()
+            quantile_levels = torch.tensor(
+                [default_lower_quantile, 0.50, default_upper_quantile],
+                device=targets.device,
+                dtype=targets.dtype,
+            )
+            quantile_predictions = torch.stack([q_low, mu, q_high], dim=-1)
+        else:
+            quantile_levels = quantile_levels.to(device=targets.device, dtype=targets.dtype).view(-1)
+            quantile_predictions = quantile_predictions.to(device=targets.device, dtype=targets.dtype)
+
         quantile_errors = targets.unsqueeze(-1) - quantile_predictions
-        pinball_loss = torch.maximum(
-            quantile_tensor.unsqueeze(0) * quantile_errors,
-            (quantile_tensor.unsqueeze(0) - 1.0) * quantile_errors,
-        ).mean()
-
-        nll_loss = 0.5 * (
-            ((targets - mu) ** 2) / variance
-            + log_variance
-            + math.log(2.0 * math.pi)
-        ).mean()
-        use_pinball_loss = bool(training_config.get("use_pinball_loss", True))
-        base_regression_loss = pinball_loss if use_pinball_loss else nll_loss
-
-        mu_scale = mu.detach().std(unbiased=False).clamp(min=1e-6)
-        mu_scaled = mu / mu_scale
-        dir_logits = mu_scaled * 3.0
-        dir_target = (targets > 0).float()
+        pinball_components = torch.maximum(
+            quantile_levels.unsqueeze(0) * quantile_errors,
+            (quantile_levels.unsqueeze(0) - 1.0) * quantile_errors,
+        )
+        pinball_loss = pinball_components.mean()
+        point_loss_weight = float(
+            self.config.get("training", {}).get("point_loss_weight", 1.0)
+        )
+        point_loss_beta = float(
+            self.config.get("training", {}).get("point_loss_beta", 0.02)
+        )
+        direction_loss_weight = float(
+            self.config.get("training", {}).get("direction_loss_weight", 0.05)
+        )
+        point_loss = F.smooth_l1_loss(mu, targets, beta=max(point_loss_beta, 1e-6))
+        median_anchor_loss = F.smooth_l1_loss(mu, quantile_median.detach(), beta=max(point_loss_beta, 1e-6))
+        target_scale = targets.detach().abs().mean().clamp(min=1e-3)
+        dir_logits = mu / target_scale
+        dir_target = (targets >= 0.0).float()
         dir_loss = F.binary_cross_entropy_with_logits(dir_logits, dir_target)
 
-        residual_scale_target = (targets - mu).detach().abs().clamp(min=1e-4, max=1.0)
-        confidence_target = self._confidence_target(residual_scale_target)
-        uncertainty_alignment_loss = F.smooth_l1_loss(
-            output["log_sigma"],
-            torch.log(residual_scale_target),
-        )
         uncertainty_alignment_weight = float(
             self.config.get("training", {}).get("uncertainty_alignment_weight", 0.05)
-        )
-        confidence_calibration_loss = F.smooth_l1_loss(
-            output["introspective_score"],
-            confidence_target,
         )
         confidence_calibration_weight = float(
             self.config.get("training", {}).get("confidence_calibration_weight", 0.10)
         )
-        attention_alignment_loss = F.smooth_l1_loss(
-            output.get("attention_stability", output["introspective_score"]),
-            output.get("variance_confidence", self._variance_confidence(output["log_sigma"])),
-        )
         attention_alignment_weight = float(
             self.config.get("training", {}).get("attention_alignment_weight", 0.05)
-        )
-        explanation_alignment_loss = F.smooth_l1_loss(
-            output["introspective_score"],
-            output.get("variance_confidence", self._variance_confidence(output["log_sigma"])),
         )
         explanation_alignment_weight = float(
             self.config.get("training", {}).get("explanation_alignment_weight", 0.05)
         )
 
+        uncertainty_alignment_loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
+        confidence_calibration_loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
+        attention_alignment_loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
+        explanation_alignment_loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
+
+        if (
+            uncertainty_alignment_weight > 0.0
+            or confidence_calibration_weight > 0.0
+            or attention_alignment_weight > 0.0
+            or explanation_alignment_weight > 0.0
+        ):
+            residual_scale_target = (targets - mu).detach().abs().clamp(min=1e-4, max=1.0)
+            interval_miss = torch.maximum(q_low - targets, targets - q_high).clamp(min=0.0)
+            confidence_target = self._confidence_target(
+                (interval_miss.detach() + 0.25 * interval_width.detach()).clamp(min=1e-4, max=1.0)
+            )
+            interval_confidence = output.get("interval_confidence", self._interval_confidence(interval_width))
+
+            if uncertainty_alignment_weight > 0.0:
+                uncertainty_alignment_loss = F.smooth_l1_loss(
+                    interval_width,
+                    (2.0 * residual_scale_target).clamp(min=1e-4, max=2.0),
+                )
+            if confidence_calibration_weight > 0.0:
+                confidence_calibration_loss = F.smooth_l1_loss(
+                    output["introspective_score"],
+                    confidence_target,
+                )
+            if attention_alignment_weight > 0.0:
+                attention_alignment_loss = F.smooth_l1_loss(
+                    output.get("attention_stability", output["introspective_score"]),
+                    interval_confidence,
+                )
+            if explanation_alignment_weight > 0.0:
+                explanation_alignment_loss = F.smooth_l1_loss(
+                    output["introspective_score"],
+                    interval_confidence,
+                )
+
         total_loss = (
-            base_regression_loss
-            + 0.3 * dir_loss
+            pinball_loss
+            + point_loss_weight * (point_loss + 0.1 * median_anchor_loss)
+            + direction_loss_weight * dir_loss
             + uncertainty_alignment_weight * uncertainty_alignment_loss
             + confidence_calibration_weight * confidence_calibration_loss
             + attention_alignment_weight * attention_alignment_loss
@@ -455,8 +581,8 @@ class MultimodalForecastModel(nn.Module):
         if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
             print(f"dir_loss value: {dir_loss.item():.6f}")
             print(f"pinball_loss value: {pinball_loss.item():.6f}")
-            print(f"nll_loss value: {nll_loss.item():.6f}")
-            print(f"base_regression_loss value: {base_regression_loss.item():.6f}")
+            print(f"point_loss value: {point_loss.item():.6f}")
+            print(f"median_anchor_loss value: {median_anchor_loss.item():.6f}")
             print(
                 "uncertainty_alignment_loss value: "
                 f"{uncertainty_alignment_loss.item():.6f}"
@@ -474,6 +600,7 @@ class MultimodalForecastModel(nn.Module):
                 f"{explanation_alignment_loss.item():.6f}"
             )
             print(f"total loss: {total_loss.item():.6f}")
+            print(f"mean interval width: {interval_width.mean().item():.6f}")
             print(f"fraction of mu > 0: {(mu > 0).float().mean().item():.6f}")
             print(f"fraction of y > 0: {(targets > 0).float().mean().item():.6f}")
             self._loss_debug_printed = True

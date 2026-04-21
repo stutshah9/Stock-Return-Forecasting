@@ -22,14 +22,16 @@ training:
   batch_size: 32
   epochs: 30
   use_amp: true
-  use_pinball_loss: true
-  pinball_quantiles: [0.10, 0.50, 0.90]
+  pinball_quantiles: [0.025, 0.05, 0.10, 0.50, 0.90, 0.95, 0.975]
+  point_loss_weight: 1.0
+  point_loss_beta: 0.02
+  direction_loss_weight: 0.05
+  early_stop_metric: val_rmse
   grad_clip_norm: 1.0
-  early_stop_metric: proposal_score
-  uncertainty_alignment_weight: 0.05
-  confidence_calibration_weight: 0.02
-  attention_alignment_weight: 0.01
-  explanation_alignment_weight: 0.01
+  uncertainty_alignment_weight: 0.0
+  confidence_calibration_weight: 0.0
+  attention_alignment_weight: 0.0
+  explanation_alignment_weight: 0.0
 
 calibration:
   coverage_levels: [0.80, 0.90, 0.95]
