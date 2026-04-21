@@ -1,5 +1,6 @@
 import os
 import sys
+from copy import deepcopy
 
 import torch
 from torch import nn
@@ -136,6 +137,41 @@ def main() -> None:
     aligned_loss = model.loss(aligned_output, zero_targets)
     misaligned_loss = model.loss(misaligned_output, zero_targets)
     assert aligned_loss.item() < misaligned_loss.item(), "alignment regularizer should reward agreement between introspective confidence and variance confidence"
+
+    preserved_training_config = deepcopy(model.config.get("training", {}))
+    pinball_test_output = {
+        "mu": torch.tensor([0.10, -0.10], dtype=torch.float32),
+        "log_sigma": torch.zeros(2, dtype=torch.float32),
+        "introspective_score": torch.full((2,), 0.5, dtype=torch.float32),
+        "variance_confidence": torch.full((2,), 0.5, dtype=torch.float32),
+    }
+    pinball_test_targets = torch.tensor([0.25, -0.30], dtype=torch.float32)
+    zero_alignment_weights = {
+        "uncertainty_alignment_weight": 0.0,
+        "confidence_calibration_weight": 0.0,
+        "attention_alignment_weight": 0.0,
+        "explanation_alignment_weight": 0.0,
+    }
+
+    model.config["training"] = {
+        **preserved_training_config,
+        **zero_alignment_weights,
+        "use_pinball_loss": True,
+        "pinball_quantiles": [0.10, 0.50, 0.90],
+    }
+    pinball_loss = model.loss(pinball_test_output, pinball_test_targets)
+
+    model.config["training"] = {
+        **preserved_training_config,
+        **zero_alignment_weights,
+        "use_pinball_loss": False,
+        "pinball_quantiles": [0.10, 0.50, 0.90],
+    }
+    nll_loss = model.loss(pinball_test_output, pinball_test_targets)
+    model.config["training"] = preserved_training_config
+
+    assert pinball_loss.item() >= 0.0, "pinball regression loss should be non-negative"
+    assert abs(pinball_loss.item() - nll_loss.item()) > 1e-6, "pinball training must use a different regression objective than Gaussian NLL"
 
     print("All fusion model tests passed.")
 

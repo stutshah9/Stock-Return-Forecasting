@@ -14,26 +14,10 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.optim import AdamW
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
-
-try:
-    from torch.amp import autocast as _autocast
-except ImportError:  # pragma: no cover - older torch fallback
-    from torch.cuda.amp import autocast as _autocast
-
-try:
-    from torch.amp import GradScaler as _GradScaler
-
-    def _make_grad_scaler(device_type: str, enabled: bool) -> Any:
-        return _GradScaler(device_type, enabled=enabled)
-
-except ImportError:  # pragma: no cover - older torch fallback
-    from torch.cuda.amp import GradScaler as _GradScaler
-
-    def _make_grad_scaler(device_type: str, enabled: bool) -> Any:
-        return _GradScaler(enabled=enabled)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -56,7 +40,6 @@ EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
 BEST_MODEL_PATH = PROJECT_ROOT / "experiments" / "model_best.pt"
-TRAINING_SUMMARY_PATH = PROJECT_ROOT / "experiments" / "training_summary.json"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -364,107 +347,6 @@ def _run_inference(
     return outputs_list, labels_list, regimes_list
 
 
-def _regression_metrics(
-    outputs: list[dict[str, float]],
-    labels: list[float],
-) -> dict[str, float]:
-    """Compute lightweight point-forecast metrics from serialized outputs."""
-
-    if not outputs or not labels:
-        return {"mae": float("nan"), "rmse": float("nan")}
-
-    mu_values = np.asarray([float(output["mu"]) for output in outputs], dtype=float)
-    label_values = np.asarray([float(label) for label in labels], dtype=float)
-    residuals = mu_values - label_values
-    return {
-        "mae": float(np.mean(np.abs(residuals))),
-        "rmse": float(np.sqrt(np.mean(residuals ** 2))),
-    }
-
-
-def _confidence_target_from_residuals(residuals: np.ndarray) -> np.ndarray:
-    """Map smaller absolute residuals to higher bounded confidence targets."""
-
-    magnitudes = np.clip(np.abs(residuals), 1e-4, 1.0)
-    center = float(np.mean(magnitudes))
-    scale = max(float(np.std(magnitudes)), 1e-3)
-    return 1.0 / (1.0 + np.exp((magnitudes - center) / scale))
-
-
-def _validation_objectives(
-    outputs: list[dict[str, float]],
-    labels: list[float],
-) -> dict[str, float]:
-    """Compute a balanced validation summary for checkpoint selection."""
-
-    if not outputs or not labels:
-        return {
-            "mae": float("nan"),
-            "rmse": float("nan"),
-            "dir_acc": float("nan"),
-            "confidence_brier": float("nan"),
-            "variance_brier": float("nan"),
-            "selective_mae": float("nan"),
-            "proposal_score": float("inf"),
-        }
-
-    mu_values = np.asarray([float(output["mu"]) for output in outputs], dtype=float)
-    label_values = np.asarray([float(label) for label in labels], dtype=float)
-    residuals = mu_values - label_values
-    mae = float(np.mean(np.abs(residuals)))
-    rmse = float(np.sqrt(np.mean(residuals ** 2)))
-    dir_acc = float(np.mean(np.sign(mu_values) == np.sign(label_values)))
-
-    confidence_target = _confidence_target_from_residuals(residuals)
-    introspective_scores = np.asarray(
-        [float(output.get("introspective_score", 0.5)) for output in outputs],
-        dtype=float,
-    )
-    variance_confidences = np.asarray(
-        [
-            float(
-                output.get(
-                    "variance_confidence",
-                    1.0 / (1.0 + math.exp(float(output.get("log_sigma", 0.0)))),
-                )
-            )
-            for output in outputs
-        ],
-        dtype=float,
-    )
-    confidence_brier = float(np.mean((introspective_scores - confidence_target) ** 2))
-    variance_brier = float(np.mean((variance_confidences - confidence_target) ** 2))
-
-    selective_mask = introspective_scores >= max(float(np.median(introspective_scores)), 0.60)
-    if np.any(selective_mask):
-        selective_mae = float(np.mean(np.abs(residuals[selective_mask])))
-    else:
-        selective_mae = mae
-
-    # Lower is better. The main project objective remains reliable calibrated
-    # forecasting, but for checkpoint selection we keep point error and
-    # directionality primary and only lightly regularize the auxiliary
-    # introspection signals.
-    proposal_score = (
-        100.0 * rmse
-        + 40.0 * mae
-        + 4.0 * (1.0 - dir_acc)
-        + 1.5 * confidence_brier
-        + 1.0 * variance_brier
-        + 5.0 * selective_mae
-    )
-
-    return {
-        "mae": mae,
-        "rmse": rmse,
-        "dir_acc": dir_acc,
-        "confidence_brier": confidence_brier,
-        "variance_brier": variance_brier,
-        "selective_mae": selective_mae,
-        "proposal_score": float(proposal_score),
-    }
-
-
 def train(config_path: str) -> None:
     """Train the multimodal forecast model and save calibration artifacts.
 
@@ -482,7 +364,14 @@ def train(config_path: str) -> None:
     seed = int(training_config.get("seed", 42))
     use_amp = bool(training_config.get("use_amp", True))
     grad_clip_norm = float(training_config.get("grad_clip_norm", 1.0))
-    early_stop_metric = str(training_config.get("early_stop_metric", "rmse")).strip().lower()
+    use_pinball_loss = bool(training_config.get("use_pinball_loss", True))
+    pinball_quantiles = [
+        float(value)
+        for value in training_config.get("pinball_quantiles", [0.10, 0.50, 0.90])
+        if 0.0 < float(value) < 1.0
+    ]
+    if not pinball_quantiles:
+        pinball_quantiles = [0.50]
 
     _set_seed(seed)
 
@@ -511,6 +400,11 @@ def train(config_path: str) -> None:
 
     device = _select_device(config)
     tqdm.write(f"Using device: {device}")
+    if use_pinball_loss:
+        quantile_text = ", ".join(f"{quantile:.2f}" for quantile in pinball_quantiles)
+        tqdm.write(f"Regression loss: pinball quantile loss [{quantile_text}]")
+    else:
+        tqdm.write("Regression loss: Gaussian negative log-likelihood")
     if device.type == "cuda":
         tqdm.write(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
@@ -581,23 +475,11 @@ def train(config_path: str) -> None:
         lr=float(training_config.get("lr", 1e-4)),
         weight_decay=1e-4,
     )
-    scaler = _make_grad_scaler(
-        device.type,
-        enabled=device.type == "cuda" and use_amp,
-    )
+    scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
 
-    if early_stop_metric not in {"loss", "rmse", "mae", "proposal_score"}:
-        raise ValueError(
-            "training.early_stop_metric must be one of: "
-            "loss, rmse, mae, proposal_score."
-        )
-
-    best_val_score = float("inf")
-    best_epoch = 0
-    best_val_metrics: dict[str, float] = {}
+    best_val_loss = float("inf")
     patience_counter = 0
     PATIENCE = 5
-    validation_history: list[dict[str, float | int]] = []
 
     for epoch_index in range(epochs):
         model.train()
@@ -616,10 +498,7 @@ def train(config_path: str) -> None:
             batch = _move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
 
-            with _autocast(
-                device_type=device.type,
-                enabled=device.type == "cuda" and use_amp,
-            ):
+            with autocast(enabled=device.type == "cuda" and use_amp):
                 outputs = model(
                     transcripts=batch["transcripts"],
                     financial=batch["financial"],
@@ -645,75 +524,22 @@ def train(config_path: str) -> None:
 
         model.eval()
         val_loss_total = 0.0
-        val_outputs: list[dict[str, float]] = []
-        val_labels: list[float] = []
         with torch.no_grad():
             for batch in val_loader:
                 batch = _move_batch_to_device(batch, device)
-                with _autocast(
-                    device_type=device.type,
-                    enabled=device.type == "cuda" and use_amp,
-                ):
+                with autocast(enabled=device.type == "cuda" and use_amp):
                     out = model(
                         transcripts=batch["transcripts"],
                         financial=batch["financial"],
                         sentiment=batch["sentiment"],
                     )
                     val_loss_total += model.loss(out, batch["labels"]).item()
-                val_outputs.extend(_serialize_output_batch(out))
-                val_labels.extend(float(value) for value in batch["labels"].cpu().tolist())
         val_loss_avg = val_loss_total / len(val_loader)
-        val_metrics = _validation_objectives(val_outputs, val_labels)
-        val_rmse = float(val_metrics["rmse"])
-        val_mae = float(val_metrics["mae"])
-        val_dir_acc = float(val_metrics["dir_acc"])
-        val_confidence_brier = float(val_metrics["confidence_brier"])
-        val_selective_mae = float(val_metrics["selective_mae"])
-        val_proposal_score = float(val_metrics["proposal_score"])
-        print(
-            "  "
-            f"val_loss={val_loss_avg:.4f} "
-            f"val_rmse={val_rmse:.4f} "
-            f"val_mae={val_mae:.4f} "
-            f"val_dir_acc={val_dir_acc:.4f} "
-            f"val_conf_brier={val_confidence_brier:.4f} "
-            f"val_selective_mae={val_selective_mae:.4f} "
-            f"val_proposal_score={val_proposal_score:.4f}"
-        )
-        validation_history.append(
-            {
-                "epoch": int(epoch_index + 1),
-                "train_loss": float(epoch_loss),
-                "val_loss": float(val_loss_avg),
-                "val_rmse": float(val_rmse),
-                "val_mae": float(val_mae),
-                "val_dir_acc": float(val_dir_acc),
-                "val_confidence_brier": float(val_confidence_brier),
-                "val_selective_mae": float(val_selective_mae),
-                "val_proposal_score": float(val_proposal_score),
-            }
-        )
+        print(f"  val_loss={val_loss_avg:.4f}")
         model.train()
 
-        current_val_score = {
-            "loss": val_loss_avg,
-            "rmse": val_rmse,
-            "mae": val_mae,
-            "proposal_score": val_proposal_score,
-        }[early_stop_metric]
-
-        if current_val_score < best_val_score:
-            best_val_score = current_val_score
-            best_epoch = epoch_index + 1
-            best_val_metrics = {
-                "val_loss": float(val_loss_avg),
-                "val_rmse": float(val_rmse),
-                "val_mae": float(val_mae),
-                "val_dir_acc": float(val_dir_acc),
-                "val_confidence_brier": float(val_confidence_brier),
-                "val_selective_mae": float(val_selective_mae),
-                "val_proposal_score": float(val_proposal_score),
-            }
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
             patience_counter = 0
             torch.save(model.state_dict(), BEST_MODEL_PATH)
         else:
@@ -740,17 +566,8 @@ def train(config_path: str) -> None:
         "labels": cal_labels,
         "regimes": cal_regimes,
     }
-    training_summary = {
-        "early_stop_metric": early_stop_metric,
-        "best_val_score": float(best_val_score),
-        "best_epoch": int(best_epoch),
-        "best_metrics": best_val_metrics,
-        "history": validation_history,
-    }
     torch.save(saved_calibration, data_output_path)
     torch.save(model.state_dict(), model_output_path)
-    with TRAINING_SUMMARY_PATH.open("w", encoding="utf-8") as summary_file:
-        json.dump(training_summary, summary_file, indent=2)
 
     # Keep compatibility with existing local tests while also saving to spec paths.
     torch.save(saved_calibration, legacy_cal_output_path)

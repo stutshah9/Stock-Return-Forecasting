@@ -22,6 +22,8 @@ training:
   batch_size: 32
   epochs: 30
   use_amp: true
+  use_pinball_loss: true
+  pinball_quantiles: [0.10, 0.50, 0.90]
   grad_clip_norm: 1.0
   early_stop_metric: proposal_score
   uncertainty_alignment_weight: 0.05

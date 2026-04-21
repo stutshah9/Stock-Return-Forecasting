@@ -1,3 +1,6 @@
+# regularize by the confidence of the explantions produced by the LLM
+# explanation augmented confomral score/ ground truth - prediction / variance * confidence from the LLM
+
 """Event-conditioned conformal calibration utilities."""
 
 from __future__ import annotations
@@ -7,7 +10,6 @@ import random
 from typing import Any
 
 import numpy as np
-
 
 SURPRISE_BANDS = ("low_surprise", "medium_surprise", "high_surprise")
 VOLATILITY_BANDS = ("low_vol", "high_vol")

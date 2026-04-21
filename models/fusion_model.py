@@ -169,6 +169,15 @@ class MultimodalForecastModel(nn.Module):
         )
         self._loss_debug_printed = False
 
+    @staticmethod
+    def _normal_quantile(quantiles: Tensor) -> Tensor:
+        """Map quantile levels in ``(0, 1)`` to standard normal z-scores."""
+
+        clamped = quantiles.clamp(min=1e-6, max=1.0 - 1e-6)
+        return torch.sqrt(torch.tensor(2.0, device=clamped.device, dtype=clamped.dtype)) * torch.special.erfinv(
+            2.0 * clamped - 1.0
+        )
+
     @classmethod
     def load_from_config(cls, config_path: str) -> MultimodalForecastModel:
         """Instantiate the model from a YAML configuration file.
@@ -350,7 +359,7 @@ class MultimodalForecastModel(nn.Module):
         return explanations
 
     def loss(self, output: dict[str, Any], y: Tensor) -> Tensor:
-        """Compute the Gaussian negative log-likelihood plus directional loss.
+        """Compute pinball quantile loss plus directional/confidence regularizers.
 
         Args:
             output: Model outputs from ``forward``.
@@ -367,13 +376,35 @@ class MultimodalForecastModel(nn.Module):
         variance = output.get("variance")
         if variance is None:
             variance = torch.exp(log_variance)
+        sigma = torch.sqrt(variance.clamp(min=1e-12))
         targets = y.to(device=mu.device, dtype=torch.float32).view(-1)
+
+        training_config = self.config.get("training", {})
+        quantiles_raw = training_config.get("pinball_quantiles", [0.10, 0.50, 0.90])
+        quantiles = [float(value) for value in quantiles_raw]
+        valid_quantiles = [value for value in quantiles if 0.0 < value < 1.0]
+        if not valid_quantiles:
+            valid_quantiles = [0.50]
+        quantile_tensor = torch.tensor(
+            valid_quantiles,
+            device=mu.device,
+            dtype=mu.dtype,
+        )
+        z_scores = self._normal_quantile(quantile_tensor)
+        quantile_predictions = mu.unsqueeze(-1) + sigma.unsqueeze(-1) * z_scores.unsqueeze(0)
+        quantile_errors = targets.unsqueeze(-1) - quantile_predictions
+        pinball_loss = torch.maximum(
+            quantile_tensor.unsqueeze(0) * quantile_errors,
+            (quantile_tensor.unsqueeze(0) - 1.0) * quantile_errors,
+        ).mean()
 
         nll_loss = 0.5 * (
             ((targets - mu) ** 2) / variance
             + log_variance
             + math.log(2.0 * math.pi)
         ).mean()
+        use_pinball_loss = bool(training_config.get("use_pinball_loss", True))
+        base_regression_loss = pinball_loss if use_pinball_loss else nll_loss
 
         mu_scale = mu.detach().std(unbiased=False).clamp(min=1e-6)
         mu_scaled = mu / mu_scale
@@ -413,7 +444,7 @@ class MultimodalForecastModel(nn.Module):
         )
 
         total_loss = (
-            nll_loss
+            base_regression_loss
             + 0.3 * dir_loss
             + uncertainty_alignment_weight * uncertainty_alignment_loss
             + confidence_calibration_weight * confidence_calibration_loss
@@ -423,7 +454,9 @@ class MultimodalForecastModel(nn.Module):
 
         if os.environ.get("DEBUG_DIRECTIONAL_LOSS") == "1" and not self._loss_debug_printed:
             print(f"dir_loss value: {dir_loss.item():.6f}")
+            print(f"pinball_loss value: {pinball_loss.item():.6f}")
             print(f"nll_loss value: {nll_loss.item():.6f}")
+            print(f"base_regression_loss value: {base_regression_loss.item():.6f}")
             print(
                 "uncertainty_alignment_loss value: "
                 f"{uncertainty_alignment_loss.item():.6f}"
