@@ -292,6 +292,7 @@ def _detail_markdown(row: pd.Series, coverage: str) -> str:
     estimated_earnings = row.get("estimated_earnings")
     actual_earnings = row.get("actual_earnings")
     earnings_surprise = row.get("earnings_surprise")
+    explanation_text = str(row.get("explanation", "") or "").strip()
     earnings_markup = ""
     if not (
         _is_missing(estimated_earnings)
@@ -304,6 +305,14 @@ def _detail_markdown(row: pd.Series, coverage: str) -> str:
             f"<div class='metric-card'><div class='metric-label'>Reported EPS</div><div class='metric-value'>{_format_decimal(actual_earnings)}</div></div>"
             f"<div class='metric-card'><div class='metric-label'>Earnings Surprise</div><div class='metric-value'>{_format_decimal(earnings_surprise)}</div></div>"
             f"<div class='metric-card'><div class='metric-label'>Regime</div><div class='metric-value'>{_format_regime(row['regime'])}</div></div>"
+            "</div>"
+        )
+    explanation_markup = ""
+    if explanation_text:
+        explanation_markup = (
+            "<div class='metric-card' style='margin-top: 14px;'>"
+            "<div class='metric-label'>Explanation</div>"
+            f"<div class='metric-value' style='font-size: 0.95rem; font-weight: 500; line-height: 1.5;'>{explanation_text}</div>"
             "</div>"
         )
 
@@ -319,6 +328,7 @@ def _detail_markdown(row: pd.Series, coverage: str) -> str:
         f"<div class='metric-card'><div class='metric-label'>Upper Bound</div><div class='metric-value'>{_format_decimal(upper)}</div></div>"
         "</div>"
         + earnings_markup
+        + explanation_markup
     )
 
 
@@ -335,10 +345,16 @@ def _details_table(row: pd.Series, coverage: str) -> pd.DataFrame:
                 "Lower": _format_decimal(row.get(f"coverage_{coverage}_lower")),
                 "Upper": _format_decimal(row.get(f"coverage_{coverage}_upper")),
                 "Width": _format_decimal(row.get(f"width_{coverage}")),
+                "Pred. Variance": _format_decimal(row.get("predicted_variance_proxy")),
+                "Expl. Conf.": _format_decimal(row.get("explanation_confidence")),
+                "Var x |Err|/Conf": _format_decimal(
+                    row.get("variance_weighted_explanation_error")
+                ),
                 "Inside": _interval_hit(row, coverage),
                 "Est. EPS": _format_decimal(row.get("estimated_earnings")),
                 "Rpt. EPS": _format_decimal(row.get("actual_earnings")),
                 "Surprise": _format_decimal(row.get("earnings_surprise")),
+                "Explanation": str(row.get("explanation", "") or ""),
             }
         ]
     )

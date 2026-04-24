@@ -431,6 +431,13 @@ def _point_prediction_for_method(
     return _to_float(output.get("point_mu", output["mu"]))
 
 
+def _prediction_variance_proxy(output: dict[str, Any]) -> float:
+    """Approximate predictive variance from the default interval half-width."""
+
+    lower, upper = _output_interval_bounds(output)
+    half_width = max((float(upper) - float(lower)) / 2.0, 1e-6)
+    return float(half_width ** 2)
+
 def _output_interval_bounds(output: dict[str, Any]) -> tuple[float, float]:
     """Read an ordered interval from serialized model outputs."""
 
@@ -493,6 +500,22 @@ def _build_global_thresholds(
         quantile_level = coverage * (1.0 + 1.0 / n)
         thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
     return thresholds
+
+
+def _mean_explanation_confidence(metadata: list[dict[str, float]] | None) -> float:
+    """Summarize explanation confidence for normalization."""
+
+    if not metadata:
+        return 1.0
+
+    values: list[float] = []
+    for row in metadata:
+        value = float(row.get("explanation_confidence", float("nan")))
+        if math.isfinite(value):
+            values.append(value)
+    if not values:
+        return 1.0
+    return max(float(np.mean(values)), 1e-6)
 
 
 def _fallback_threshold(
@@ -585,6 +608,7 @@ def _compute_model_outputs(
             transcripts=transcripts,
             financial=financial,
             sentiment=sentiment,
+            return_explanations=True,
         )
 
     outputs: list[dict[str, float]] = []
@@ -609,6 +633,9 @@ def _compute_model_outputs(
         if modality_values is not None
         else [0.0 for _ in batch_outputs["q_low"].cpu().tolist()]
     )
+    explanations = batch_outputs.get("explanations")
+    if explanations is None:
+        explanations = ["" for _ in batch_outputs["q_low"].cpu().tolist()]
 
     for index, (
         q_low,
@@ -656,6 +683,7 @@ def _compute_model_outputs(
                 "interval_confidence": float(interval_confidence),
                 "variance_confidence": float(interval_confidence),
                 "modality_consistency": float(modality_consistency),
+                "explanation": str(explanations[index]),
             }
         )
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
@@ -704,6 +732,11 @@ def _compute_same_ticker_baseline(
                 "q_high": float(mu + sigma),
                 "mu": float(mu),
                 "introspective_score": 1.0,
+                "variance_confidence": 1.0,
+                "explanation": (
+                    "The baseline forecasts from the same ticker's historical post-earnings "
+                    "return mean and volatility rather than the multimodal explanation head."
+                ),
             }
         )
         labels.append(float(event.get("label", 0.0)))
@@ -740,6 +773,50 @@ def _predict_interval_naive(
     mu = _point_prediction_for_method(output, "naive_conformal")
     threshold = global_thresholds[float(coverage)]
     return mu - threshold, mu + threshold
+
+
+def _predict_interval_confidence_scaled_naive(
+    output: dict[str, Any],
+    coverage: float,
+    global_thresholds: dict[float, float],
+    explanation_confidence: float,
+    mean_explanation_confidence: float,
+) -> tuple[float, float]:
+    """Scale the naive conformal threshold using the configured confidence/variance rule."""
+
+    mu = _point_prediction_for_method(output, "ours")
+    base_threshold = float(global_thresholds[float(coverage)])
+    variance = max(_prediction_variance_proxy(output), 1e-6)
+    normalized_confidence = max(float(explanation_confidence), 1e-6) / max(
+        float(mean_explanation_confidence),
+        1e-6,
+    )
+    variance_sqrt = math.sqrt(variance)
+    rule = os.environ.get("OURS_INTERVAL_RULE", "confidence_only").strip().lower()
+    variance_floor = max(float(os.environ.get("OURS_VARIANCE_FLOOR", "0.0025")), 1e-6)
+    max_scale = max(float(os.environ.get("OURS_SCALE_MAX", "10.0")), 1e-6)
+
+    if rule == "divide_variance":
+        scale = normalized_confidence / variance
+    elif rule == "divide_sqrt_variance":
+        scale = normalized_confidence / max(variance_sqrt, 1e-6)
+    elif rule == "multiply_variance":
+        scale = normalized_confidence * variance
+    elif rule == "multiply_sqrt_variance":
+        scale = normalized_confidence * variance_sqrt
+    elif rule == "confidence_only":
+        scale = normalized_confidence
+    elif rule == "clamped_divide_variance":
+        scale = normalized_confidence / max(variance, variance_floor)
+        scale = min(scale, max_scale)
+    else:
+        raise ValueError(
+            "OURS_INTERVAL_RULE must be one of: divide_variance, divide_sqrt_variance, "
+            "multiply_variance, multiply_sqrt_variance, confidence_only, clamped_divide_variance."
+        )
+
+    adjusted_threshold = base_threshold * scale
+    return mu - adjusted_threshold, mu + adjusted_threshold
 
 
 def _regime_components(regime: str) -> tuple[str, str]:
@@ -802,6 +879,7 @@ def _metric_row(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    reference_explanation_confidence: float | None = None,
 ) -> dict[str, float | str]:
     """Compute evaluation metrics for one method row."""
 
@@ -835,8 +913,19 @@ def _metric_row(
 
     if metadata is None:
         metadata = [{} for _ in outputs]
+    mean_explanation_confidence = (
+        float(reference_explanation_confidence)
+        if reference_explanation_confidence is not None
+        else _mean_explanation_confidence(metadata)
+    )
 
     for output, label, regime, event_metadata in zip(outputs, labels, regimes, metadata):
+        explanation_confidence = float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
         for coverage in coverages:
             if mode == "adaptive":
                 try:
@@ -852,6 +941,14 @@ def _metric_row(
                     lower, upper = base_lower - threshold, base_upper + threshold
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
+            elif mode == "confidence_scaled_naive":
+                lower, upper = _predict_interval_confidence_scaled_naive(
+                    output=output,
+                    coverage=coverage,
+                    global_thresholds=global_thresholds,
+                    explanation_confidence=explanation_confidence,
+                    mean_explanation_confidence=mean_explanation_confidence,
+                )
             else:
                 lower, upper = _predict_interval_without_adjustment(
                     predictor,
@@ -891,6 +988,7 @@ def _subgroup_metric_rows(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    reference_explanation_confidence: float | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Compute subgroup metrics by surprise band and volatility regime."""
 
@@ -920,6 +1018,7 @@ def _subgroup_metric_rows(
             global_thresholds=global_thresholds,
             mode=mode,
             metadata=subgroup_metadata,
+            reference_explanation_confidence=reference_explanation_confidence,
         )
         row["subgroup_type"] = subgroup_type
         row["subgroup"] = subgroup_name
@@ -940,6 +1039,7 @@ def _prediction_rows(
     mode: str,
     metadata: list[dict[str, float]] | None = None,
     financial_lookup: dict[tuple[str, str], dict[str, float]] | None = None,
+    reference_explanation_confidence: float | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Build per-event prediction rows for export and lightweight inspection."""
 
@@ -948,6 +1048,11 @@ def _prediction_rows(
         metadata = [_event_calibration_metadata(event) for event in events]
     if financial_lookup is None:
         financial_lookup = {}
+    mean_explanation_confidence = (
+        float(reference_explanation_confidence)
+        if reference_explanation_confidence is not None
+        else _mean_explanation_confidence(metadata)
+    )
 
     for event, output, label, regime, ticker, event_metadata in zip(
         events,
@@ -968,6 +1073,19 @@ def _prediction_rows(
                 )
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
+            elif mode == "confidence_scaled_naive":
+                lower, upper = _predict_interval_confidence_scaled_naive(
+                    output=output,
+                    coverage=coverage,
+                    global_thresholds=global_thresholds,
+                    explanation_confidence=float(
+                        event_metadata.get(
+                            "explanation_confidence",
+                            output.get("introspective_score", 0.0),
+                        )
+                    ),
+                    mean_explanation_confidence=mean_explanation_confidence,
+                )
             else:
                 lower, upper = _predict_interval_without_adjustment(
                     predictor,
@@ -985,6 +1103,12 @@ def _prediction_rows(
         transcript_preview = transcript_text[:240].replace("\n", " ").strip()
         feature_values = _feature_triplet(event)
         mu = _point_prediction_for_method(output, method)
+        explanation_confidence = float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
         financial_metadata = financial_lookup.get(
             (str(ticker).upper(), str(event.get("date", ""))),
             {},
@@ -1040,16 +1164,12 @@ def _prediction_rows(
                 "implied_vol": float(feature_values[2]),
                 "avg_sentiment": float(sentiment_values[0]),
                 "message_volume": float(sentiment_values[1]),
-                "explanation_confidence": float(
-                    event_metadata.get(
-                        "explanation_confidence",
-                        output.get("introspective_score", 0.0),
-                    )
-                ),
+                "explanation_confidence": explanation_confidence,
                 "modality_disagreement": float(
                     event_metadata.get("modality_disagreement", 0.0)
                 ),
                 "direction_match": int(np.sign(mu) == np.sign(float(label))),
+                "explanation": str(output.get("explanation", "")).strip(),
                 "transcript_preview": transcript_preview,
             }
         )
@@ -1061,15 +1181,23 @@ def _selective_metric_rows(
     labels: list[float],
     regimes: list[str],
     predictor: EventConditionedConformalPredictor,
+    global_thresholds: dict[float, float],
+    mode: str,
     min_scores: list[float],
     coverage: float = 0.90,
     metadata: list[dict[str, float]] | None = None,
+    reference_explanation_confidence: float | None = None,
 ) -> list[dict[str, float | str]]:
     """Compute a lightweight selective prediction risk-coverage table."""
 
     rows: list[dict[str, float | str]] = []
     if metadata is None:
         metadata = [{} for _ in outputs]
+    mean_explanation_confidence = (
+        float(reference_explanation_confidence)
+        if reference_explanation_confidence is not None
+        else _mean_explanation_confidence(metadata)
+    )
     for min_score in min_scores:
         kept_indices: list[int] = []
         interval_widths: list[float] = []
@@ -1077,16 +1205,34 @@ def _selective_metric_rows(
         for index, (output, label, regime, event_metadata) in enumerate(
             zip(outputs, labels, regimes, metadata)
         ):
-            interval = predictor.selective_predict(
-                output=output,
-                regime=regime,
-                coverage=coverage,
-                min_score=min_score,
-                metadata=event_metadata,
+            explanation_confidence = float(
+                event_metadata.get(
+                    "explanation_confidence",
+                    output.get("introspective_score", 0.0),
+                )
             )
-            if interval is None:
+            score_for_selection = float(output.get("introspective_score", explanation_confidence))
+            if score_for_selection < float(min_score):
                 continue
-            lower, upper = interval
+            if mode == "confidence_scaled_naive":
+                lower, upper = _predict_interval_confidence_scaled_naive(
+                    output=output,
+                    coverage=coverage,
+                    global_thresholds=global_thresholds,
+                    explanation_confidence=explanation_confidence,
+                    mean_explanation_confidence=mean_explanation_confidence,
+                )
+            else:
+                interval = predictor.selective_predict(
+                    output=output,
+                    regime=regime,
+                    coverage=coverage,
+                    min_score=min_score,
+                    metadata=event_metadata,
+                )
+                if interval is None:
+                    continue
+                lower, upper = interval
             kept_indices.append(index)
             interval_widths.append(upper - lower)
             interval_hits.append(1.0 if lower <= label <= upper else 0.0)
@@ -1223,11 +1369,10 @@ def evaluate(config_path: str) -> None:
     )
 
     coverage_levels = list(config.get("calibration", {}).get("coverage_levels", [0.80, 0.90, 0.95]))
-    event_conditioned_predictor = EventConditionedConformalPredictor(
-        coverage_levels=coverage_levels,
-        use_attention_conditioning=True,
-        use_explanation_adjustment=False,
+    include_selective_analysis = bool(
+        config.get("evaluation", {}).get("include_selective_analysis", False)
     )
+    print(f"Ours interval rule: {os.environ.get('OURS_INTERVAL_RULE', 'confidence_only')}")
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1235,22 +1380,26 @@ def evaluate(config_path: str) -> None:
         financial_outputs=cal_financial_outputs,
         sentiment_outputs=cal_sentiment_outputs,
     )
-    event_conditioned_predictor.calibrate(
-        cal_outputs=cal_outputs,
-        cal_labels=cal_labels,
-        cal_regimes=cal_regimes,
-        cal_metadata=cal_metadata,
-    )
+    calibration_explanation_confidence = _mean_explanation_confidence(cal_metadata)
     global_thresholds = _build_global_thresholds(cal_outputs, cal_labels, coverage_levels)
     historical_events = train_events + val_events + cal_events
+    event_conditioned_predictor = EventConditionedConformalPredictor(
+        coverage_levels=coverage_levels,
+        use_attention_conditioning=True,
+        use_explanation_adjustment=False,
+    )
+    if include_selective_analysis:
+        event_conditioned_predictor.calibrate(
+            cal_outputs=cal_outputs,
+            cal_labels=cal_labels,
+            cal_regimes=cal_regimes,
+            cal_metadata=cal_metadata,
+        )
 
     results_rows: list[dict[str, float | str]] = []
     subgroup_rows: list[dict[str, float | str | int]] = []
     selective_rows: list[dict[str, float | str]] = []
     prediction_rows: list[dict[str, float | str | int]] = []
-    include_selective_analysis = bool(
-        config.get("evaluation", {}).get("include_selective_analysis", False)
-    )
 
     evaluation_specs: list[tuple[str, str, EventConditionedConformalPredictor]] = [
         ("text_only", "raw_quantile", event_conditioned_predictor),
@@ -1258,7 +1407,7 @@ def evaluate(config_path: str) -> None:
         ("sentiment_only", "raw_quantile", event_conditioned_predictor),
         ("full_multimodal", "raw_quantile", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
-        ("ours", "adaptive", event_conditioned_predictor),
+        ("ours", "confidence_scaled_naive", event_conditioned_predictor),
     ]
 
     for method, mode, _active_predictor in evaluation_specs:
@@ -1319,6 +1468,7 @@ def evaluate(config_path: str) -> None:
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
+                reference_explanation_confidence=calibration_explanation_confidence,
             )
         )
         prediction_rows.extend(
@@ -1334,6 +1484,7 @@ def evaluate(config_path: str) -> None:
                 mode=mode,
                 metadata=test_metadata,
                 financial_lookup=financial_lookup,
+                reference_explanation_confidence=calibration_explanation_confidence,
             )
         )
         if include_selective_analysis and method == "ours":
@@ -1343,6 +1494,8 @@ def evaluate(config_path: str) -> None:
                     labels=labels,
                     regimes=regimes,
                     predictor=active_predictor,
+                    global_thresholds=global_thresholds,
+                    mode=mode,
                     min_scores=[
                         float(score)
                         for score in config.get("calibration", {}).get(
@@ -1351,6 +1504,7 @@ def evaluate(config_path: str) -> None:
                         )
                     ],
                     metadata=test_metadata,
+                    reference_explanation_confidence=calibration_explanation_confidence,
                 )
             )
         subgroup_rows.extend(
@@ -1363,6 +1517,7 @@ def evaluate(config_path: str) -> None:
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
+                reference_explanation_confidence=calibration_explanation_confidence,
             )
         )
 
@@ -1380,6 +1535,7 @@ def evaluate(config_path: str) -> None:
             predictor=event_conditioned_predictor,
             global_thresholds=global_thresholds,
             mode="naive",
+            reference_explanation_confidence=calibration_explanation_confidence,
         )
     )
     prediction_rows.extend(
@@ -1394,6 +1550,7 @@ def evaluate(config_path: str) -> None:
             global_thresholds=global_thresholds,
             mode="naive",
             financial_lookup=financial_lookup,
+            reference_explanation_confidence=calibration_explanation_confidence,
         )
     )
     subgroup_rows.extend(
@@ -1405,6 +1562,7 @@ def evaluate(config_path: str) -> None:
             predictor=event_conditioned_predictor,
             global_thresholds=global_thresholds,
             mode="naive",
+            reference_explanation_confidence=calibration_explanation_confidence,
         )
     )
 
