@@ -31,6 +31,7 @@ from data.event_utils import (
     filter_events_by_universe,
     summarize_event_coverage,
 )
+from experiments.llm_confidence import attach_llm_confidence
 from models.fusion_model import MultimodalForecastModel
 
 
@@ -431,6 +432,14 @@ def _point_prediction_for_method(
     return _to_float(output.get("point_mu", output["mu"]))
 
 
+def _prediction_variance_proxy(output: dict[str, Any]) -> float:
+    """Approximate predictive variance from the default interval half-width."""
+
+    lower, upper = _output_interval_bounds(output)
+    half_width = max((float(upper) - float(lower)) / 2.0, 1e-6)
+    return float(half_width ** 2)
+
+
 def _output_interval_bounds(output: dict[str, Any]) -> tuple[float, float]:
     """Read an ordered interval from serialized model outputs."""
 
@@ -493,6 +502,96 @@ def _build_global_thresholds(
         quantile_level = coverage * (1.0 + 1.0 / n)
         thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
     return thresholds
+
+
+def _finite_signal_values(
+    metadata: list[dict[str, float]] | None,
+    signal_key: str,
+    default: float = 0.5,
+) -> list[float]:
+    """Read bounded confidence signal values from metadata."""
+
+    if metadata is None:
+        return []
+    values: list[float] = []
+    for row in metadata:
+        try:
+            value = float(row.get(signal_key, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        if math.isfinite(value):
+            values.append(min(max(value, 1e-6), 1.0))
+    return values
+
+
+def _mean_confidence_signal(
+    metadata: list[dict[str, float]] | None,
+    signal_key: str,
+    default: float = 0.5,
+) -> float:
+    """Summarize a confidence signal for normalization."""
+
+    values = _finite_signal_values(metadata, signal_key, default=default)
+    if not values:
+        return max(float(default), 1e-6)
+    return max(float(np.mean(values)), 1e-6)
+
+
+def _confidence_scale(
+    metadata: dict[str, float],
+    signal_key: str,
+    reference_mean: float,
+    default: float = 0.5,
+) -> float:
+    """Map confidence to a positive interval multiplier."""
+
+    try:
+        confidence = float(metadata.get(signal_key, default))
+    except (TypeError, ValueError):
+        confidence = float(default)
+    confidence = min(max(confidence, 1e-6), 1.0)
+    return max(float(reference_mean), 1e-6) / confidence
+
+
+def _build_confidence_scaled_thresholds(
+    cal_outputs: list[dict[str, Any]],
+    cal_labels: list[float],
+    coverage_levels: list[float],
+    cal_metadata: list[dict[str, float]],
+    signal_key: str,
+    reference_mean: float,
+) -> dict[float, float]:
+    """Build conformal thresholds after normalizing residuals by confidence."""
+
+    scaled_scores: list[float] = []
+    for output, label, metadata in zip(cal_outputs, cal_labels, cal_metadata):
+        mu = _point_prediction_for_method(output, "ours")
+        scale = _confidence_scale(metadata, signal_key, reference_mean)
+        scaled_scores.append(abs(float(label) - mu) / max(scale, 1e-6))
+
+    thresholds: dict[float, float] = {}
+    n = len(scaled_scores)
+    for coverage in coverage_levels:
+        quantile_level = coverage * (1.0 + 1.0 / n)
+        thresholds[float(coverage)] = _conformal_quantile(scaled_scores, quantile_level)
+    return thresholds
+
+
+def _predict_interval_confidence_scaled(
+    output: dict[str, Any],
+    coverage: float,
+    scaled_thresholds: dict[float, float],
+    metadata: dict[str, float],
+    signal_key: str,
+    reference_mean: float,
+) -> tuple[float, float]:
+    """Predict a conformal interval scaled by a calibrated confidence signal."""
+
+    mu = _point_prediction_for_method(output, "ours")
+    threshold = float(scaled_thresholds[float(coverage)])
+    scale = _confidence_scale(metadata, signal_key, reference_mean)
+    adjusted_threshold = threshold * scale
+    return mu - adjusted_threshold, mu + adjusted_threshold
 
 
 def _fallback_threshold(
@@ -585,6 +684,7 @@ def _compute_model_outputs(
             transcripts=transcripts,
             financial=financial,
             sentiment=sentiment,
+            return_explanations=True,
         )
 
     outputs: list[dict[str, float]] = []
@@ -609,6 +709,9 @@ def _compute_model_outputs(
         if modality_values is not None
         else [0.0 for _ in batch_outputs["q_low"].cpu().tolist()]
     )
+    explanations = batch_outputs.get("explanations")
+    if explanations is None:
+        explanations = ["" for _ in batch_outputs["q_low"].cpu().tolist()]
 
     for index, (
         q_low,
@@ -656,6 +759,7 @@ def _compute_model_outputs(
                 "interval_confidence": float(interval_confidence),
                 "variance_confidence": float(interval_confidence),
                 "modality_consistency": float(modality_consistency),
+                "explanation": str(explanations[index]),
             }
         )
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
@@ -704,6 +808,11 @@ def _compute_same_ticker_baseline(
                 "q_high": float(mu + sigma),
                 "mu": float(mu),
                 "introspective_score": 1.0,
+                "variance_confidence": 1.0,
+                "explanation": (
+                    "The baseline forecast uses the same ticker's historical "
+                    "post-earnings return mean and volatility."
+                ),
             }
         )
         labels.append(float(event.get("label", 0.0)))
@@ -802,6 +911,9 @@ def _metric_row(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    confidence_scaled_thresholds: dict[str, dict[float, float]] | None = None,
+    confidence_reference_means: dict[str, float] | None = None,
+    confidence_signal_key: str | None = None,
 ) -> dict[str, float | str]:
     """Compute evaluation metrics for one method row."""
 
@@ -835,6 +947,10 @@ def _metric_row(
 
     if metadata is None:
         metadata = [{} for _ in outputs]
+    if confidence_scaled_thresholds is None:
+        confidence_scaled_thresholds = {}
+    if confidence_reference_means is None:
+        confidence_reference_means = {}
 
     for output, label, regime, event_metadata in zip(outputs, labels, regimes, metadata):
         for coverage in coverages:
@@ -852,6 +968,17 @@ def _metric_row(
                     lower, upper = base_lower - threshold, base_upper + threshold
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
+            elif mode == "confidence_scaled":
+                if confidence_signal_key is None:
+                    raise ValueError("confidence_scaled mode requires a confidence signal key.")
+                lower, upper = _predict_interval_confidence_scaled(
+                    output=output,
+                    coverage=coverage,
+                    scaled_thresholds=confidence_scaled_thresholds[confidence_signal_key],
+                    metadata=event_metadata,
+                    signal_key=confidence_signal_key,
+                    reference_mean=confidence_reference_means[confidence_signal_key],
+                )
             else:
                 lower, upper = _predict_interval_without_adjustment(
                     predictor,
@@ -866,6 +993,14 @@ def _metric_row(
     avg_width_80 = float(np.mean(interval_widths[0.80]))
     avg_width_90 = float(np.mean(interval_widths[0.90]))
     avg_width_95 = float(np.mean(interval_widths[0.95]))
+    explanation_confidences = _finite_signal_values(metadata, "explanation_confidence")
+    llm_stated_confidences = _finite_signal_values(metadata, "llm_stated_confidence")
+    variance_values = [_prediction_variance_proxy(output) for output in outputs]
+    abs_errors = [abs(mu - y) for mu, y in zip(mu_values, labels)]
+    variance_weighted_errors = [
+        error / math.sqrt(max(variance, 1e-8))
+        for error, variance in zip(abs_errors, variance_values)
+    ]
 
     return {
         "method": method,
@@ -879,6 +1014,10 @@ def _metric_row(
         "MAE": mae,
         "RMSE": rmse,
         "dir_acc": dir_acc,
+        "avg_explanation_confidence": float(np.mean(explanation_confidences)) if explanation_confidences else float("nan"),
+        "avg_llm_stated_confidence": float(np.mean(llm_stated_confidences)) if llm_stated_confidences else float("nan"),
+        "avg_predicted_variance_proxy": float(np.mean(variance_values)) if variance_values else float("nan"),
+        "avg_variance_weighted_explanation_error": float(np.mean(variance_weighted_errors)) if variance_weighted_errors else float("nan"),
     }
 
 
@@ -891,6 +1030,9 @@ def _subgroup_metric_rows(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    confidence_scaled_thresholds: dict[str, dict[float, float]] | None = None,
+    confidence_reference_means: dict[str, float] | None = None,
+    confidence_signal_key: str | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Compute subgroup metrics by surprise band and volatility regime."""
 
@@ -920,6 +1062,9 @@ def _subgroup_metric_rows(
             global_thresholds=global_thresholds,
             mode=mode,
             metadata=subgroup_metadata,
+            confidence_scaled_thresholds=confidence_scaled_thresholds,
+            confidence_reference_means=confidence_reference_means,
+            confidence_signal_key=confidence_signal_key,
         )
         row["subgroup_type"] = subgroup_type
         row["subgroup"] = subgroup_name
@@ -940,6 +1085,9 @@ def _prediction_rows(
     mode: str,
     metadata: list[dict[str, float]] | None = None,
     financial_lookup: dict[tuple[str, str], dict[str, float]] | None = None,
+    confidence_scaled_thresholds: dict[str, dict[float, float]] | None = None,
+    confidence_reference_means: dict[str, float] | None = None,
+    confidence_signal_key: str | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Build per-event prediction rows for export and lightweight inspection."""
 
@@ -948,6 +1096,10 @@ def _prediction_rows(
         metadata = [_event_calibration_metadata(event) for event in events]
     if financial_lookup is None:
         financial_lookup = {}
+    if confidence_scaled_thresholds is None:
+        confidence_scaled_thresholds = {}
+    if confidence_reference_means is None:
+        confidence_reference_means = {}
 
     for event, output, label, regime, ticker, event_metadata in zip(
         events,
@@ -968,6 +1120,17 @@ def _prediction_rows(
                 )
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
+            elif mode == "confidence_scaled":
+                if confidence_signal_key is None:
+                    raise ValueError("confidence_scaled mode requires a confidence signal key.")
+                lower, upper = _predict_interval_confidence_scaled(
+                    output=output,
+                    coverage=coverage,
+                    scaled_thresholds=confidence_scaled_thresholds[confidence_signal_key],
+                    metadata=event_metadata,
+                    signal_key=confidence_signal_key,
+                    reference_mean=confidence_reference_means[confidence_signal_key],
+                )
             else:
                 lower, upper = _predict_interval_without_adjustment(
                     predictor,
@@ -985,6 +1148,19 @@ def _prediction_rows(
         transcript_preview = transcript_text[:240].replace("\n", " ").strip()
         feature_values = _feature_triplet(event)
         mu = _point_prediction_for_method(output, method)
+        abs_error = abs(mu - float(label))
+        predicted_variance = _prediction_variance_proxy(output)
+        explanation_confidence = float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
+        llm_stated_confidence = float(event_metadata.get("llm_stated_confidence", float("nan")))
+        llm_logprob_confidence = float(event_metadata.get("llm_logprob_confidence", float("nan")))
+        llm_rating_token_logprob = float(event_metadata.get("llm_rating_token_logprob", float("nan")))
+        explanation_adjusted_abs_error = abs_error / max(explanation_confidence, 1e-6)
+        variance_weighted_explanation_error = abs_error / math.sqrt(max(predicted_variance, 1e-8))
         financial_metadata = financial_lookup.get(
             (str(ticker).upper(), str(event.get("date", ""))),
             {},
@@ -999,8 +1175,10 @@ def _prediction_rows(
                 "actual_return": float(label),
                 "expected_return": mu,
                 "predicted_return": mu,
+                "abs_error": abs_error,
                 "actual_minus_expected": float(label) - mu,
                 "prediction_error": mu - float(label),
+                "predicted_variance_proxy": predicted_variance,
                 "predicted_q_low": float(output.get("q_low", mu)),
                 "predicted_q_high": float(output.get("q_high", mu)),
                 "base_interval_width": float(
@@ -1014,6 +1192,13 @@ def _prediction_rows(
                     )
                 ),
                 "introspective_score": float(output.get("introspective_score", 0.0)),
+                "variance_confidence": float(output.get("variance_confidence", 0.0)),
+                "explanation_confidence": explanation_confidence,
+                "llm_stated_confidence": llm_stated_confidence,
+                "llm_logprob_confidence": llm_logprob_confidence,
+                "llm_rating_token_logprob": llm_rating_token_logprob,
+                "explanation_adjusted_abs_error": explanation_adjusted_abs_error,
+                "variance_weighted_explanation_error": variance_weighted_explanation_error,
                 "coverage_80_lower": interval_bounds[0.80][0],
                 "coverage_80_upper": interval_bounds[0.80][1],
                 "interval_80": f"[{interval_bounds[0.80][0]:.4f}, {interval_bounds[0.80][1]:.4f}]",
@@ -1040,16 +1225,13 @@ def _prediction_rows(
                 "implied_vol": float(feature_values[2]),
                 "avg_sentiment": float(sentiment_values[0]),
                 "message_volume": float(sentiment_values[1]),
-                "explanation_confidence": float(
-                    event_metadata.get(
-                        "explanation_confidence",
-                        output.get("introspective_score", 0.0),
-                    )
-                ),
                 "modality_disagreement": float(
                     event_metadata.get("modality_disagreement", 0.0)
                 ),
                 "direction_match": int(np.sign(mu) == np.sign(float(label))),
+                "explanation": str(
+                    event_metadata.get("llm_explanation", output.get("explanation", ""))
+                ).strip(),
                 "transcript_preview": transcript_preview,
             }
         )
@@ -1235,6 +1417,7 @@ def evaluate(config_path: str) -> None:
         financial_outputs=cal_financial_outputs,
         sentiment_outputs=cal_sentiment_outputs,
     )
+    cal_metadata = attach_llm_confidence(cal_events, cal_outputs, cal_metadata)
     event_conditioned_predictor.calibrate(
         cal_outputs=cal_outputs,
         cal_labels=cal_labels,
@@ -1242,6 +1425,22 @@ def evaluate(config_path: str) -> None:
         cal_metadata=cal_metadata,
     )
     global_thresholds = _build_global_thresholds(cal_outputs, cal_labels, coverage_levels)
+    confidence_signal_keys = ["llm_stated_confidence", "llm_logprob_confidence"]
+    confidence_reference_means = {
+        signal_key: _mean_confidence_signal(cal_metadata, signal_key)
+        for signal_key in confidence_signal_keys
+    }
+    confidence_scaled_thresholds = {
+        signal_key: _build_confidence_scaled_thresholds(
+            cal_outputs=cal_outputs,
+            cal_labels=cal_labels,
+            coverage_levels=coverage_levels,
+            cal_metadata=cal_metadata,
+            signal_key=signal_key,
+            reference_mean=confidence_reference_means[signal_key],
+        )
+        for signal_key in confidence_signal_keys
+    }
     historical_events = train_events + val_events + cal_events
 
     results_rows: list[dict[str, float | str]] = []
@@ -1258,11 +1457,11 @@ def evaluate(config_path: str) -> None:
         ("sentiment_only", "raw_quantile", event_conditioned_predictor),
         ("full_multimodal", "raw_quantile", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
-        ("ours", "adaptive", event_conditioned_predictor),
+        ("ours_adaptive", "adaptive", event_conditioned_predictor),
     ]
 
     for method, mode, _active_predictor in evaluation_specs:
-        base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
+        base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours_adaptive"} else method
         outputs, labels, regimes, _tickers = _compute_model_outputs(
             model=model,
             events=test_events,
@@ -1296,6 +1495,7 @@ def evaluate(config_path: str) -> None:
         reference_center=disagreement_center,
         reference_scale=disagreement_scale,
     )
+    test_metadata = attach_llm_confidence(test_events, test_full_outputs, test_metadata)
 
     method_payloads: dict[str, tuple[list[dict[str, float]], list[float], list[str], list[str]]] = {
         "text_only": (test_text_outputs, test_labels, test_regimes, test_tickers),
@@ -1303,40 +1503,62 @@ def evaluate(config_path: str) -> None:
         "sentiment_only": (test_sentiment_outputs, test_labels, test_regimes, test_tickers),
         "full_multimodal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "naive_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
-        "ours": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "ours_adaptive": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "ours_llm_stated": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "ours_llm_logprob": (test_full_outputs, test_labels, test_regimes, test_tickers),
     }
+    evaluation_specs.extend(
+        [
+            ("ours_llm_stated", "confidence_scaled", event_conditioned_predictor),
+            ("ours_llm_logprob", "confidence_scaled", event_conditioned_predictor),
+        ]
+    )
+    signal_by_method = {
+        "ours_llm_stated": "llm_stated_confidence",
+        "ours_llm_logprob": "llm_logprob_confidence",
+    }
+    internal_ours_methods = {"ours_adaptive", "ours_llm_stated", "ours_llm_logprob"}
+    preliminary_rows: dict[str, dict[str, float | str]] = {}
 
     for method, mode, active_predictor in evaluation_specs:
         outputs, labels, regimes, _tickers = method_payloads[method]
+        confidence_signal_key = signal_by_method.get(method)
 
-        results_rows.append(
-            _metric_row(
-                method=method,
-                outputs=outputs,
-                labels=labels,
-                regimes=regimes,
-                predictor=active_predictor,
-                global_thresholds=global_thresholds,
-                mode=mode,
-                metadata=test_metadata,
-            )
+        row = _metric_row(
+            method=method,
+            outputs=outputs,
+            labels=labels,
+            regimes=regimes,
+            predictor=active_predictor,
+            global_thresholds=global_thresholds,
+            mode=mode,
+            metadata=test_metadata,
+            confidence_scaled_thresholds=confidence_scaled_thresholds,
+            confidence_reference_means=confidence_reference_means,
+            confidence_signal_key=confidence_signal_key,
         )
-        prediction_rows.extend(
-            _prediction_rows(
-                method=method,
-                events=test_events,
-                outputs=outputs,
-                labels=labels,
-                regimes=regimes,
-                tickers=_tickers,
-                predictor=active_predictor,
-                global_thresholds=global_thresholds,
-                mode=mode,
-                metadata=test_metadata,
-                financial_lookup=financial_lookup,
+        preliminary_rows[method] = row
+        if method not in internal_ours_methods:
+            results_rows.append(row)
+            prediction_rows.extend(
+                _prediction_rows(
+                    method=method,
+                    events=test_events,
+                    outputs=outputs,
+                    labels=labels,
+                    regimes=regimes,
+                    tickers=_tickers,
+                    predictor=active_predictor,
+                    global_thresholds=global_thresholds,
+                    mode=mode,
+                    metadata=test_metadata,
+                    financial_lookup=financial_lookup,
+                    confidence_scaled_thresholds=confidence_scaled_thresholds,
+                    confidence_reference_means=confidence_reference_means,
+                    confidence_signal_key=confidence_signal_key,
+                )
             )
-        )
-        if include_selective_analysis and method == "ours":
+        if include_selective_analysis and method == "ours_adaptive":
             selective_rows.extend(
                 _selective_metric_rows(
                     outputs=outputs,
@@ -1353,18 +1575,70 @@ def evaluate(config_path: str) -> None:
                     metadata=test_metadata,
                 )
             )
-        subgroup_rows.extend(
-            _subgroup_metric_rows(
-                method=method,
-                outputs=outputs,
-                labels=labels,
-                regimes=regimes,
-                predictor=active_predictor,
-                global_thresholds=global_thresholds,
-                mode=mode,
-                metadata=test_metadata,
+        if method not in internal_ours_methods:
+            subgroup_rows.extend(
+                _subgroup_metric_rows(
+                    method=method,
+                    outputs=outputs,
+                    labels=labels,
+                    regimes=regimes,
+                    predictor=active_predictor,
+                    global_thresholds=global_thresholds,
+                    mode=mode,
+                    metadata=test_metadata,
+                    confidence_scaled_thresholds=confidence_scaled_thresholds,
+                    confidence_reference_means=confidence_reference_means,
+                    confidence_signal_key=confidence_signal_key,
+                )
             )
+
+    best_confidence_method = min(
+        ("ours_llm_stated", "ours_llm_logprob"),
+        key=lambda method_name: (
+            -float(preliminary_rows[method_name]["coverage_80"])
+            -float(preliminary_rows[method_name]["coverage_90"])
+            -float(preliminary_rows[method_name]["coverage_95"])
+            + 0.10 * float(preliminary_rows[method_name]["avg_width"])
+        ),
+    )
+    ours_row = dict(preliminary_rows[best_confidence_method])
+    ours_row["method"] = "ours"
+    ours_row["selected_confidence_signal"] = signal_by_method[best_confidence_method]
+    results_rows.append(ours_row)
+    selected_signal_key = signal_by_method[best_confidence_method]
+    prediction_rows.extend(
+        _prediction_rows(
+            method="ours",
+            events=test_events,
+            outputs=test_full_outputs,
+            labels=test_labels,
+            regimes=test_regimes,
+            tickers=test_tickers,
+            predictor=event_conditioned_predictor,
+            global_thresholds=global_thresholds,
+            mode="confidence_scaled",
+            metadata=test_metadata,
+            financial_lookup=financial_lookup,
+            confidence_scaled_thresholds=confidence_scaled_thresholds,
+            confidence_reference_means=confidence_reference_means,
+            confidence_signal_key=selected_signal_key,
         )
+    )
+    subgroup_rows.extend(
+        _subgroup_metric_rows(
+            method="ours",
+            outputs=test_full_outputs,
+            labels=test_labels,
+            regimes=test_regimes,
+            predictor=event_conditioned_predictor,
+            global_thresholds=global_thresholds,
+            mode="confidence_scaled",
+            metadata=test_metadata,
+            confidence_scaled_thresholds=confidence_scaled_thresholds,
+            confidence_reference_means=confidence_reference_means,
+            confidence_signal_key=selected_signal_key,
+        )
+    )
 
     baseline_outputs, baseline_labels, baseline_regimes, _baseline_tickers = _compute_same_ticker_baseline(
         test_events=test_events,

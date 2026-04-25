@@ -70,6 +70,9 @@ def main() -> None:
         "avg_width_90",
         "avg_width_95",
         "dir_acc",
+        "avg_explanation_confidence",
+        "avg_predicted_variance_proxy",
+        "avg_variance_weighted_explanation_error",
     ]
     for column in required_columns:
         assert column in results.columns, "results.csv missing required column"
@@ -120,14 +123,27 @@ def main() -> None:
         "actual_return",
         "expected_return",
         "predicted_return",
+        "abs_error",
         "prediction_error",
+        "predicted_variance_proxy",
+        "variance_confidence",
+        "explanation_confidence",
+        "llm_stated_confidence",
+        "llm_logprob_confidence",
+        "llm_rating_token_logprob",
+        "explanation_adjusted_abs_error",
+        "variance_weighted_explanation_error",
         "coverage_90_lower",
         "coverage_90_upper",
         "regime",
+        "explanation",
     ]
     for column in prediction_required_columns:
         assert column in predictions.columns, "predictions.csv missing required column"
     assert len(predictions) > 0, "predictions.csv must contain at least one row"
+    assert (
+        predictions["explanation"].fillna("").astype(str).str.len().gt(0).all()
+    ), "Each prediction row must include a non-empty explanation"
 
     print("All evaluation tests passed.")
 
