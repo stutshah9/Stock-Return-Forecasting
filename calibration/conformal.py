@@ -216,7 +216,13 @@ def _interval_bounds(
 
     mu = _to_float(output["mu"])
     log_sigma = _to_float(output.get("log_sigma", 0.0))
-    half_width = math.exp(log_sigma)
+    sigma = math.exp(log_sigma)
+
+    # Use coverage-appropriate z-score for Gaussian intervals
+    z_scores = {0.80: 1.28, 0.90: 1.645, 0.95: 1.96}
+    z = z_scores.get(float(coverage), 1.645) if coverage is not None else 1.0
+
+    half_width = z * sigma
     return float(mu - half_width), float(mu + half_width)
 
 
