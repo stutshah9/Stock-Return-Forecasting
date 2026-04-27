@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/post_ta_changes_conformal",
+  "result_branch": "falcon-results/post-ta-conformal-20260427",
+  "label": "post_ta_changes_conformal",
+  "start_utc": "2026-04-27T17:14:09Z",
+  "end_utc": "2026-04-27T17:17:17Z",
+  "exit_code": 0,
+  "slurm_job_id": "379295",
+  "host": "fal016",
+  "source_commit": "6836e79a6c74a8d9d6deb3290fd92d935135853a"
+}
