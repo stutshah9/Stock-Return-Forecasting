@@ -1,0 +1,7 @@
+diagnostic,n,value,expected_direction
+confidence_residual_spearman,713,-0.06990358587294539,negative
+rubric_residual_spearman,713,-0.028072361544502173,negative
+low_confidence_mae,179,0.03273015437135863,higher_than_high_confidence
+high_confidence_mae,179,0.027273450006211213,lower_than_low_confidence
+real_minus_permuted_interval_width_90,713,-0.002502257309805994,nonzero_if_explanation_signal_matters
+avg_generated_explanation_rubric,713,0.9077840112201964,higher_is_better

@@ -38,4 +38,20 @@ calibration:
   selective_min_scores: [0.55, 0.70, 0.85]
 
 evaluation:
-  include_selective_analysis: false
+  include_selective_analysis: true
+  include_modality_ablations: false
+  primary_baseline: linear_ridge
+  bootstrap_samples: 500
+  strong_baselines:
+    - market_return
+    - sector_return
+    - post_earnings_drift
+    - analyst_surprise
+    - implied_vol_only
+    - linear_ridge
+    - ticker_fixed_effects
+    - xgboost_lightgbm_proxy
+  rolling_backtest:
+    enabled: true
+    test_years: [2023, 2024, 2025]
+    min_train_years: 2

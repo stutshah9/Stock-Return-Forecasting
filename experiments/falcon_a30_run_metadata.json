@@ -1,0 +1,26 @@
+{
+  "job_id": "379386",
+  "cluster": "falcon2.arc.vt.edu",
+  "remote_workdir": "~/earnings_forecast_paper_a30_clean",
+  "partition": "a30_normal_q",
+  "gpu": "NVIDIA A30",
+  "slurm_state": "COMPLETED",
+  "exit_code": "0:0",
+  "elapsed": "00:15:05",
+  "log_path": "logs/earnings-paper-a30-379386.out",
+  "primary_results": {
+    "method": "ours",
+    "coverage_80": 0.82328190743338,
+    "coverage_90": 0.9214586255259467,
+    "coverage_95": 0.9719495091164095,
+    "avg_width": 0.17900134917520796,
+    "mae": 0.02924455866847611,
+    "rmse": 0.045388865815291016,
+    "directional_accuracy": 0.5455820476858345
+  },
+  "verification": {
+    "remote_py_compile": "passed",
+    "local_py_compile": "passed",
+    "local_phase7_test": "passed after local CPU fallback; Falcon artifacts were restored afterward"
+  }
+}

@@ -13,6 +13,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from scipy import stats
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from tabulate import tabulate
 import yaml
 
@@ -38,6 +44,7 @@ EVENTS_CACHE_PATH = PROJECT_ROOT / "data" / "events_cache.pt"
 FEATURE_STATS_PATH = PROJECT_ROOT / "experiments" / "feature_stats.json"
 REGIME_THRESHOLDS_PATH = PROJECT_ROOT / "experiments" / "regime_thresholds.json"
 FINANCIALS_PATH = PROJECT_ROOT / "data" / "financials.csv"
+SP500_TICKERS_PATH = PROJECT_ROOT / "data" / "sp500_tickers.csv"
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -159,6 +166,36 @@ def _load_financial_lookup() -> dict[tuple[str, str], dict[str, float]]:
             "actual_earnings": _safe_numeric_row_value(row, "actual_earnings"),
             "earnings_surprise": _safe_numeric_row_value(row, "earnings_surprise"),
         }
+    return lookup
+
+
+def _load_ticker_sector_lookup() -> dict[str, str]:
+    """Load optional ticker-sector metadata when it exists locally."""
+
+    if not SP500_TICKERS_PATH.is_file():
+        return {}
+
+    try:
+        tickers = pd.read_csv(SP500_TICKERS_PATH)
+    except Exception:
+        return {}
+    if "ticker" not in tickers.columns:
+        return {}
+
+    sector_column = None
+    for candidate in ("sector", "gics_sector", "GICS Sector", "industry", "Industry"):
+        if candidate in tickers.columns:
+            sector_column = candidate
+            break
+    if sector_column is None:
+        return {}
+
+    lookup: dict[str, str] = {}
+    for _, row in tickers.iterrows():
+        ticker = str(row.get("ticker", "")).upper()
+        sector = str(row.get(sector_column, "")).strip()
+        if ticker and sector and sector.lower() != "nan":
+            lookup[ticker] = sector
     return lookup
 
 
@@ -330,6 +367,52 @@ def _event_calibration_metadata(event: dict[str, Any]) -> dict[str, float]:
         "avg_sentiment": float(avg_sentiment),
         "message_volume": float(message_volume),
     }
+
+
+def _event_sector(event: dict[str, Any], sector_lookup: dict[str, str]) -> str:
+    """Return a stable sector label for subgrouping and sector baselines."""
+
+    for key in ("sector", "gics_sector", "industry"):
+        value = str(event.get(key, "")).strip()
+        if value and value.lower() != "nan":
+            return value
+    ticker = str(event.get("ticker", "")).upper()
+    return sector_lookup.get(ticker, "unknown")
+
+
+def _event_feature_row(event: dict[str, Any], sector_lookup: dict[str, str]) -> dict[str, Any]:
+    """Build a tabular feature row for non-neural baseline models."""
+
+    sue, momentum, implied_vol = _feature_triplet(event)
+    sentiment, message_volume = _sentiment_pair(event)
+    ticker = str(event.get("ticker", "")).upper()
+    return {
+        "ticker": ticker,
+        "sector": _event_sector(event, sector_lookup),
+        "year": int(event.get("year", 0)),
+        "sue": float(sue),
+        "abs_sue": abs(float(sue)),
+        "momentum": float(momentum),
+        "implied_vol": float(implied_vol),
+        "avg_sentiment": float(sentiment),
+        "message_volume": float(message_volume),
+        "transcript_length": float(len(str(event.get("transcript", "") or ""))),
+    }
+
+
+def _events_to_frame(
+    events: list[dict[str, Any]],
+    sector_lookup: dict[str, str],
+) -> pd.DataFrame:
+    """Convert cached events into a model-ready baseline feature table."""
+
+    return pd.DataFrame([_event_feature_row(event, sector_lookup) for event in events])
+
+
+def _event_labels(events: list[dict[str, Any]]) -> np.ndarray:
+    """Return event labels as a finite float array."""
+
+    return np.asarray([float(event.get("label", 0.0)) for event in events], dtype=float)
 
 
 def _explanation_confidence_from_disagreement(
@@ -647,6 +730,7 @@ def _compute_model_outputs(
             transcripts=transcripts,
             financial=financial,
             sentiment=sentiment,
+            return_explanations=True,
         )
 
     outputs: list[dict[str, float]] = []
@@ -674,8 +758,9 @@ def _compute_model_outputs(
         if modality_strength_values is not None
         else [[0.0, 0.0, 0.0] for _ in batch_outputs["mu"].cpu().tolist()]
     )
+    explanations = list(batch_outputs.get("explanations", []))
 
-    for (
+    for index, (
         mu,
         log_sigma,
         score,
@@ -683,7 +768,7 @@ def _compute_model_outputs(
         variance_confidence,
         modality_consistency,
         modality_strengths,
-    ) in zip(
+    ) in enumerate(zip(
         batch_outputs["mu"].cpu().tolist(),
         batch_outputs["log_sigma"].cpu().tolist(),
         batch_outputs["introspective_score"].cpu().tolist(),
@@ -691,7 +776,7 @@ def _compute_model_outputs(
         variance_list,
         modality_list,
         modality_strength_list,
-    ):
+    )):
         strength_values = [float(value) for value in list(modality_strengths)[:3]]
         while len(strength_values) < 3:
             strength_values.append(0.0)
@@ -706,64 +791,260 @@ def _compute_model_outputs(
                 "text_strength": strength_values[0],
                 "financial_strength": strength_values[1],
                 "sentiment_strength": strength_values[2],
+                "explanation": str(explanations[index]) if index < len(explanations) else "",
             }
         )
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
 
 
-def _same_ticker_baseline_parameters(
-    ticker: str,
-    training_events: list[dict[str, Any]],
-) -> tuple[float, float]:
-    """Estimate same-ticker baseline mean and volatility from training labels."""
+def _outputs_from_mu_sigma(
+    mu_values: np.ndarray,
+    sigma: float | np.ndarray,
+    confidence: float = 0.5,
+) -> list[dict[str, float]]:
+    """Serialize baseline predictions into the common Gaussian output shape."""
 
-    same_ticker_returns = [
-        float(event["label"])
-        for event in training_events
-        if str(event.get("ticker", "")).upper() == ticker.upper()
-        and not math.isnan(float(event.get("label", math.nan)))
-    ]
-    if len(same_ticker_returns) >= 2:
-        mu = float(np.mean(same_ticker_returns))
-        sigma = float(np.std(same_ticker_returns, ddof=1))
-        if sigma > 0.0:
-            return mu, sigma
-        return mu, 0.02
-    return 0.0, 0.02
-
-
-def _compute_same_ticker_baseline(
-    test_events: list[dict[str, Any]],
-    training_events: list[dict[str, Any]],
-    regime_thresholds: dict[str, float],
-) -> tuple[list[dict[str, float]], list[float], list[str], list[str]]:
-    """Build a same-ticker historical-mean and volatility baseline."""
-
+    sigma_values = (
+        np.full(len(mu_values), float(sigma), dtype=float)
+        if np.isscalar(sigma)
+        else np.asarray(sigma, dtype=float)
+    )
     outputs: list[dict[str, float]] = []
-    labels: list[float] = []
-    regimes: list[str] = []
-    tickers: list[str] = []
-
-    for event in test_events:
-        ticker = str(event.get("ticker", "")).upper()
-        mu, sigma = _same_ticker_baseline_parameters(ticker, training_events)
+    for mu, sigma_value in zip(mu_values, sigma_values):
         outputs.append(
             {
                 "mu": float(mu),
-                "log_sigma": float(math.log(max(sigma, 1e-6))),
-                "introspective_score": 1.0,
+                "log_sigma": float(math.log(max(float(sigma_value), 1e-6))),
+                "introspective_score": float(confidence),
             }
         )
-        labels.append(float(event.get("label", 0.0)))
-        regimes.append(
-            assign_regime(
-                sue=_event_sue(event),
-                implied_vol=_event_implied_vol(event),
-                thresholds=regime_thresholds,
+    return outputs
+
+
+def _residual_sigma(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Estimate a robust residual scale for baseline intervals."""
+
+    residuals = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
+    if residuals.size < 2:
+        return 0.02
+    sigma = float(np.std(residuals, ddof=1))
+    return sigma if math.isfinite(sigma) and sigma > 1e-6 else 0.02
+
+
+def _history_group_mean_predictions(
+    train_events: list[dict[str, Any]],
+    target_events: list[dict[str, Any]],
+    sector_lookup: dict[str, str],
+    group_key: str | None,
+) -> tuple[np.ndarray, float]:
+    """Predict target returns with historical global, sector, or ticker means."""
+
+    train_labels = _event_labels(train_events)
+    global_mu = float(np.mean(train_labels)) if len(train_labels) else 0.0
+    grouped: dict[str, list[float]] = {}
+
+    for event in train_events:
+        if group_key == "ticker":
+            key = str(event.get("ticker", "")).upper()
+        elif group_key == "sector":
+            key = _event_sector(event, sector_lookup)
+        else:
+            key = "market"
+        grouped.setdefault(key, []).append(float(event.get("label", 0.0)))
+
+    target_mu: list[float] = []
+    for event in target_events:
+        if group_key == "ticker":
+            key = str(event.get("ticker", "")).upper()
+        elif group_key == "sector":
+            key = _event_sector(event, sector_lookup)
+        else:
+            key = "market"
+        values = grouped.get(key, [])
+        target_mu.append(float(np.mean(values)) if values else global_mu)
+
+    train_mu = []
+    for event in train_events:
+        if group_key == "ticker":
+            key = str(event.get("ticker", "")).upper()
+        elif group_key == "sector":
+            key = _event_sector(event, sector_lookup)
+        else:
+            key = "market"
+        values = grouped.get(key, [])
+        train_mu.append(float(np.mean(values)) if values else global_mu)
+
+    return np.asarray(target_mu, dtype=float), _residual_sigma(train_labels, np.asarray(train_mu))
+
+
+def _make_tabular_pipeline(
+    method: str,
+    numeric_features: list[str],
+    categorical_features: list[str] | None = None,
+) -> Pipeline:
+    """Create a tabular baseline estimator with preprocessing."""
+
+    categorical_features = list(categorical_features or [])
+    transformers: list[tuple[str, Any, list[str]]] = []
+    if numeric_features:
+        transformers.append(("numeric", StandardScaler(), numeric_features))
+    if categorical_features:
+        try:
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        except TypeError:  # pragma: no cover - older scikit-learn compatibility
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        transformers.append(
+            (
+                "categorical",
+                encoder,
+                categorical_features,
             )
         )
-        tickers.append(ticker)
-    return outputs, labels, regimes, tickers
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+
+    if method == "gradient_boosting":
+        estimator = HistGradientBoostingRegressor(
+            max_iter=160,
+            learning_rate=0.04,
+            l2_regularization=0.01,
+            random_state=42,
+        )
+    else:
+        estimator = Ridge(alpha=5.0)
+    return Pipeline([("preprocess", preprocessor), ("model", estimator)])
+
+
+def _fit_predict_tabular_baseline(
+    method: str,
+    train_events: list[dict[str, Any]],
+    target_events: list[dict[str, Any]],
+    sector_lookup: dict[str, str],
+    numeric_features: list[str],
+    categorical_features: list[str] | None = None,
+) -> tuple[np.ndarray, float]:
+    """Fit a tabular baseline on historical events and predict target events."""
+
+    train_frame = _events_to_frame(train_events, sector_lookup)
+    target_frame = _events_to_frame(target_events, sector_lookup)
+    y_train = _event_labels(train_events)
+    if len(train_frame) < 8:
+        fallback_mu = float(np.mean(y_train)) if len(y_train) else 0.0
+        return np.full(len(target_events), fallback_mu), 0.02
+
+    pipeline = _make_tabular_pipeline(
+        method=method,
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
+    )
+    pipeline.fit(train_frame, y_train)
+    train_pred = np.asarray(pipeline.predict(train_frame), dtype=float)
+    target_pred = np.asarray(pipeline.predict(target_frame), dtype=float)
+    return target_pred, _residual_sigma(y_train, train_pred)
+
+
+def _compute_strong_baseline(
+    method: str,
+    train_events: list[dict[str, Any]],
+    target_events: list[dict[str, Any]],
+    regime_thresholds: dict[str, float],
+    sector_lookup: dict[str, str],
+) -> tuple[list[dict[str, float]], list[float], list[str], list[str]]:
+    """Compute one paper-oriented non-neural baseline."""
+
+    if method == "market_return":
+        mu_values, sigma = _history_group_mean_predictions(
+            train_events, target_events, sector_lookup, group_key=None
+        )
+    elif method == "sector_return":
+        mu_values, sigma = _history_group_mean_predictions(
+            train_events, target_events, sector_lookup, group_key="sector"
+        )
+    elif method == "post_earnings_drift":
+        mu_values, sigma = _history_group_mean_predictions(
+            train_events, target_events, sector_lookup, group_key="ticker"
+        )
+    elif method == "analyst_surprise":
+        mu_values, sigma = _fit_predict_tabular_baseline(
+            method="ridge",
+            train_events=train_events,
+            target_events=target_events,
+            sector_lookup=sector_lookup,
+            numeric_features=["sue", "abs_sue"],
+        )
+    elif method == "implied_vol_only":
+        mu_values, sigma = _fit_predict_tabular_baseline(
+            method="ridge",
+            train_events=train_events,
+            target_events=target_events,
+            sector_lookup=sector_lookup,
+            numeric_features=["implied_vol"],
+        )
+    elif method == "linear_ridge":
+        mu_values, sigma = _fit_predict_tabular_baseline(
+            method="ridge",
+            train_events=train_events,
+            target_events=target_events,
+            sector_lookup=sector_lookup,
+            numeric_features=[
+                "sue",
+                "abs_sue",
+                "momentum",
+                "implied_vol",
+                "avg_sentiment",
+                "message_volume",
+                "transcript_length",
+            ],
+        )
+    elif method == "ticker_fixed_effects":
+        mu_values, sigma = _fit_predict_tabular_baseline(
+            method="ridge",
+            train_events=train_events,
+            target_events=target_events,
+            sector_lookup=sector_lookup,
+            numeric_features=["sue", "momentum", "implied_vol"],
+            categorical_features=["ticker"],
+        )
+    elif method == "xgboost_lightgbm_proxy":
+        mu_values, sigma = _fit_predict_tabular_baseline(
+            method="gradient_boosting",
+            train_events=train_events,
+            target_events=target_events,
+            sector_lookup=sector_lookup,
+            numeric_features=[
+                "sue",
+                "abs_sue",
+                "momentum",
+                "implied_vol",
+                "avg_sentiment",
+                "message_volume",
+                "transcript_length",
+            ],
+            categorical_features=["sector"],
+        )
+    else:
+        raise ValueError(f"Unsupported baseline method: {method}")
+
+    labels = [float(event.get("label", 0.0)) for event in target_events]
+    regimes = [
+        assign_regime(
+            sue=_event_sue(event),
+            implied_vol=_event_implied_vol(event),
+            thresholds=regime_thresholds,
+        )
+        for event in target_events
+    ]
+    tickers = [str(event.get("ticker", "")).upper() for event in target_events]
+    return _outputs_from_mu_sigma(mu_values, sigma), labels, regimes, tickers
+
+
+def _baseline_global_thresholds(
+    outputs: list[dict[str, float]],
+    labels: list[float],
+    coverage_levels: list[float],
+) -> dict[float, float]:
+    """Build per-baseline conformal thresholds from calibration residuals."""
+
+    return _build_global_thresholds(outputs, labels, coverage_levels)
 
 
 def _predict_interval_without_adjustment(
@@ -929,6 +1210,18 @@ def _metric_row(
         "coverage_80": float(np.mean(interval_hits[0.80])),
         "coverage_90": float(np.mean(interval_hits[0.90])),
         "coverage_95": float(np.mean(interval_hits[0.95])),
+        "coverage_error_80": float(np.mean(interval_hits[0.80]) - 0.80),
+        "coverage_error_90": float(np.mean(interval_hits[0.90]) - 0.90),
+        "coverage_error_95": float(np.mean(interval_hits[0.95]) - 0.95),
+        "mean_abs_coverage_error": float(
+            np.mean(
+                [
+                    abs(np.mean(interval_hits[0.80]) - 0.80),
+                    abs(np.mean(interval_hits[0.90]) - 0.90),
+                    abs(np.mean(interval_hits[0.95]) - 0.95),
+                ]
+            )
+        ),
         "avg_width": float(np.mean([avg_width_80, avg_width_90, avg_width_95])),
         "avg_width_80": avg_width_80,
         "avg_width_90": avg_width_90,
@@ -948,14 +1241,23 @@ def _subgroup_metric_rows(
     global_thresholds: dict[float, float],
     mode: str,
     metadata: list[dict[str, float]] | None = None,
+    events: list[dict[str, Any]] | None = None,
+    sector_lookup: dict[str, str] | None = None,
 ) -> list[dict[str, float | str | int]]:
-    """Compute subgroup metrics by surprise band and volatility regime."""
+    """Compute subgroup metrics by surprise, volatility, attention, and sector."""
 
     subgroup_members: dict[tuple[str, str], list[int]] = {}
     for index, regime in enumerate(regimes):
         surprise_band, volatility_band = _regime_components(regime)
         subgroup_members.setdefault(("surprise_band", surprise_band), []).append(index)
         subgroup_members.setdefault(("volatility_band", volatility_band), []).append(index)
+    if events is not None:
+        sector_lookup = sector_lookup or {}
+        for index, event in enumerate(events):
+            subgroup_members.setdefault(
+                ("ticker_sector", _event_sector(event, sector_lookup)),
+                [],
+            ).append(index)
 
     rows: list[dict[str, float | str | int]] = []
     if metadata is None:
@@ -1128,6 +1430,7 @@ def _prediction_rows(
                 "evidence_direction_alignment": float(
                     event_metadata.get("evidence_direction_alignment", 0.0)
                 ),
+                "generated_explanation": str(output.get("explanation", "")),
                 "direction_match": int(np.sign(mu) == np.sign(float(label))),
                 "transcript_preview": transcript_preview,
             }
@@ -1212,6 +1515,299 @@ def _selective_metric_rows(
     return rows
 
 
+def _wilson_interval(successes: int, n: int, alpha: float = 0.05) -> tuple[float, float]:
+    """Wilson confidence interval for a binomial proportion."""
+
+    if n <= 0:
+        return float("nan"), float("nan")
+    z = float(stats.norm.ppf(1.0 - alpha / 2.0))
+    p = successes / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt((p * (1.0 - p) / n) + (z * z / (4.0 * n * n))) / denom
+    return float(max(0.0, center - half)), float(min(1.0, center + half))
+
+
+def _bootstrap_metric_ci(
+    errors: np.ndarray,
+    metric: str,
+    rng: np.random.Generator,
+    n_bootstrap: int = 500,
+) -> tuple[float, float]:
+    """Bootstrap a confidence interval for MAE or RMSE from per-event errors."""
+
+    if errors.size == 0:
+        return float("nan"), float("nan")
+    values: list[float] = []
+    indices = np.arange(errors.size)
+    for _ in range(max(int(n_bootstrap), 20)):
+        sample = errors[rng.choice(indices, size=errors.size, replace=True)]
+        if metric == "rmse":
+            values.append(float(np.sqrt(np.mean(np.square(sample)))))
+        else:
+            values.append(float(np.mean(np.abs(sample))))
+    return (
+        float(np.quantile(values, 0.025)),
+        float(np.quantile(values, 0.975)),
+    )
+
+
+def _diebold_mariano_pvalue(
+    errors_a: np.ndarray,
+    errors_b: np.ndarray,
+) -> float:
+    """Compute a simple paired Diebold-Mariano p-value with squared-error loss."""
+
+    if errors_a.size != errors_b.size or errors_a.size < 3:
+        return float("nan")
+    loss_diff = np.square(errors_a) - np.square(errors_b)
+    diff_std = float(np.std(loss_diff, ddof=1))
+    if diff_std <= 1e-12:
+        return 1.0
+    dm_stat = float(np.mean(loss_diff) / (diff_std / math.sqrt(loss_diff.size)))
+    return float(2.0 * stats.t.sf(abs(dm_stat), df=loss_diff.size - 1))
+
+
+def _significance_rows(
+    prediction_rows: list[dict[str, float | str | int]],
+    baseline_method: str,
+    n_bootstrap: int = 500,
+) -> list[dict[str, float | str | int]]:
+    """Build bootstrap, paired-comparison, and direction-accuracy statistics."""
+
+    table = pd.DataFrame(prediction_rows)
+    required = {"method", "ticker", "date", "actual_return", "predicted_return"}
+    if table.empty or not required.issubset(table.columns):
+        return []
+
+    rows: list[dict[str, float | str | int]] = []
+    rng = np.random.default_rng(42)
+    baseline = table.loc[table["method"] == baseline_method].copy()
+    baseline_keyed = baseline.set_index(["ticker", "date"]) if not baseline.empty else pd.DataFrame()
+
+    for method, method_frame in table.groupby("method"):
+        method_frame = method_frame.copy()
+        errors = (
+            method_frame["predicted_return"].astype(float).to_numpy()
+            - method_frame["actual_return"].astype(float).to_numpy()
+        )
+        mae_low, mae_high = _bootstrap_metric_ci(errors, "mae", rng, n_bootstrap)
+        rmse_low, rmse_high = _bootstrap_metric_ci(errors, "rmse", rng, n_bootstrap)
+        direction_hits = (
+            np.sign(method_frame["predicted_return"].astype(float).to_numpy())
+            == np.sign(method_frame["actual_return"].astype(float).to_numpy())
+        )
+        dir_low, dir_high = _wilson_interval(int(direction_hits.sum()), int(direction_hits.size))
+
+        paired_mae_delta = float("nan")
+        dm_pvalue = float("nan")
+        if not baseline_keyed.empty and method != baseline_method:
+            joined = method_frame.set_index(["ticker", "date"]).join(
+                baseline_keyed[["actual_return", "predicted_return"]],
+                rsuffix="_baseline",
+                how="inner",
+            )
+            if not joined.empty:
+                method_errors = (
+                    joined["predicted_return"].astype(float).to_numpy()
+                    - joined["actual_return"].astype(float).to_numpy()
+                )
+                baseline_errors = (
+                    joined["predicted_return_baseline"].astype(float).to_numpy()
+                    - joined["actual_return"].astype(float).to_numpy()
+                )
+                paired_mae_delta = float(
+                    np.mean(np.abs(method_errors) - np.abs(baseline_errors))
+                )
+                dm_pvalue = _diebold_mariano_pvalue(method_errors, baseline_errors)
+
+        rows.append(
+            {
+                "method": str(method),
+                "baseline_method": baseline_method,
+                "n": int(errors.size),
+                "mae_ci_low": mae_low,
+                "mae_ci_high": mae_high,
+                "rmse_ci_low": rmse_low,
+                "rmse_ci_high": rmse_high,
+                "dir_acc_ci_low": dir_low,
+                "dir_acc_ci_high": dir_high,
+                "paired_mae_delta_vs_baseline": paired_mae_delta,
+                "dm_pvalue_vs_baseline": dm_pvalue,
+            }
+        )
+    return rows
+
+
+def _explanation_diagnostic_rows(
+    outputs: list[dict[str, float]],
+    labels: list[float],
+    metadata: list[dict[str, float | str]],
+    predictor: EventConditionedConformalPredictor,
+    regimes: list[str],
+) -> list[dict[str, float | str | int]]:
+    """Score generated explanations and test confidence-residual relationships."""
+
+    if not outputs:
+        return []
+    residuals = np.asarray(
+        [abs(float(output["mu"]) - float(label)) for output, label in zip(outputs, labels)],
+        dtype=float,
+    )
+    confidences = np.asarray(
+        [
+            float(event_metadata.get("explanation_confidence", output.get("introspective_score", 0.5)))
+            for output, event_metadata in zip(outputs, metadata)
+        ],
+        dtype=float,
+    )
+    rubric_scores: list[float] = []
+    for output, event_metadata in zip(outputs, metadata):
+        explanation = str(output.get("explanation", ""))
+        score = 0.0
+        score += 0.25 if ("positive" in explanation or "negative" in explanation) else 0.0
+        score += 0.25 if ("uncertainty" in explanation or "variance" in explanation) else 0.0
+        score += 0.25 if any(token in explanation for token in ("transcript", "financial", "sentiment")) else 0.0
+        score += 0.25 * float(event_metadata.get("evidence_direction_alignment", 0.5))
+        rubric_scores.append(float(score))
+
+    corr = float(stats.spearmanr(confidences, residuals).correlation) if len(outputs) >= 3 else float("nan")
+    rubric_corr = (
+        float(stats.spearmanr(np.asarray(rubric_scores), residuals).correlation)
+        if len(outputs) >= 3
+        else float("nan")
+    )
+
+    shuffled_metadata = [dict(row) for row in metadata]
+    rng = np.random.default_rng(42)
+    shuffled_confidence = np.asarray(confidences, dtype=float).copy()
+    rng.shuffle(shuffled_confidence)
+    for row, value in zip(shuffled_metadata, shuffled_confidence):
+        row["explanation_confidence"] = float(value)
+        row["explanation_grounding_score"] = float(value)
+
+    real_widths: list[float] = []
+    shuffled_widths: list[float] = []
+    for output, regime, real_metadata, permuted_metadata in zip(
+        outputs, regimes, metadata, shuffled_metadata
+    ):
+        lo, hi = predictor.predict_interval(output, regime, coverage=0.90, metadata=real_metadata)
+        real_widths.append(float(hi - lo))
+        lo_perm, hi_perm = predictor.predict_interval(
+            output,
+            regime,
+            coverage=0.90,
+            metadata=permuted_metadata,
+        )
+        shuffled_widths.append(float(hi_perm - lo_perm))
+
+    low_cut = float(np.quantile(confidences, 0.25)) if len(confidences) else 0.0
+    high_cut = float(np.quantile(confidences, 0.75)) if len(confidences) else 1.0
+    low_mask = confidences <= low_cut
+    high_mask = confidences >= high_cut
+
+    return [
+        {
+            "diagnostic": "confidence_residual_spearman",
+            "n": int(len(outputs)),
+            "value": corr,
+            "expected_direction": "negative",
+        },
+        {
+            "diagnostic": "rubric_residual_spearman",
+            "n": int(len(outputs)),
+            "value": rubric_corr,
+            "expected_direction": "negative",
+        },
+        {
+            "diagnostic": "low_confidence_mae",
+            "n": int(np.sum(low_mask)),
+            "value": float(np.mean(residuals[low_mask])) if np.any(low_mask) else float("nan"),
+            "expected_direction": "higher_than_high_confidence",
+        },
+        {
+            "diagnostic": "high_confidence_mae",
+            "n": int(np.sum(high_mask)),
+            "value": float(np.mean(residuals[high_mask])) if np.any(high_mask) else float("nan"),
+            "expected_direction": "lower_than_low_confidence",
+        },
+        {
+            "diagnostic": "real_minus_permuted_interval_width_90",
+            "n": int(len(outputs)),
+            "value": float(np.mean(real_widths) - np.mean(shuffled_widths)),
+            "expected_direction": "nonzero_if_explanation_signal_matters",
+        },
+        {
+            "diagnostic": "avg_generated_explanation_rubric",
+            "n": int(len(outputs)),
+            "value": float(np.mean(rubric_scores)),
+            "expected_direction": "higher_is_better",
+        },
+    ]
+
+
+def _rolling_backtest_rows(
+    events: list[dict[str, Any]],
+    config: dict[str, Any],
+    sector_lookup: dict[str, str],
+    baseline_methods: list[str],
+) -> list[dict[str, float | str | int]]:
+    """Run rolling yearly backtests for strong tabular/historical baselines."""
+
+    rolling_config = config.get("evaluation", {}).get("rolling_backtest", {})
+    if not bool(rolling_config.get("enabled", True)):
+        return []
+    years = sorted({int(event.get("year", 0)) for event in events if int(event.get("year", 0)) > 0})
+    requested_years = rolling_config.get("test_years")
+    if requested_years:
+        years = [int(year) for year in requested_years if int(year) in years]
+
+    min_train_years = int(rolling_config.get("min_train_years", 2))
+    rows: list[dict[str, float | str | int]] = []
+    for test_year in years:
+        cal_year = test_year - 1
+        train_events = [event for event in events if int(event.get("year", 0)) < cal_year]
+        cal_events = [event for event in events if int(event.get("year", 0)) == cal_year]
+        test_events = [event for event in events if int(event.get("year", 0)) == test_year]
+        if len({int(event.get("year", 0)) for event in train_events}) < min_train_years:
+            continue
+        if not train_events or not cal_events or not test_events:
+            continue
+        thresholds = fit_regime_thresholds(train_events)
+        coverage_levels = list(config.get("calibration", {}).get("coverage_levels", [0.80, 0.90, 0.95]))
+        for method in baseline_methods:
+            outputs, labels, regimes, _tickers = _compute_strong_baseline(
+                method=method,
+                train_events=train_events,
+                target_events=test_events,
+                regime_thresholds=thresholds,
+                sector_lookup=sector_lookup,
+            )
+            cal_outputs, cal_labels, _cal_regimes, _cal_tickers = _compute_strong_baseline(
+                method=method,
+                train_events=train_events,
+                target_events=cal_events,
+                regime_thresholds=thresholds,
+                sector_lookup=sector_lookup,
+            )
+            global_thresholds = _baseline_global_thresholds(cal_outputs, cal_labels, coverage_levels)
+            row = _metric_row(
+                method=method,
+                outputs=outputs,
+                labels=labels,
+                regimes=regimes,
+                predictor=EventConditionedConformalPredictor(coverage_levels=coverage_levels),
+                global_thresholds=global_thresholds,
+                mode="naive",
+            )
+            row["test_year"] = int(test_year)
+            row["train_years"] = ",".join(str(year) for year in sorted({int(e.get("year", 0)) for e in train_events}))
+            row["calibration_year"] = int(cal_year)
+            row["n_test"] = int(len(test_events))
+            rows.append(row)
+    return rows
+
+
 def evaluate(config_path: str) -> None:
     """Evaluate the trained model, ablations, and conformal baselines.
 
@@ -1244,6 +1840,7 @@ def evaluate(config_path: str) -> None:
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
     financial_lookup = _load_financial_lookup()
+    sector_lookup = _load_ticker_sector_lookup()
 
     device = _select_device(config)
     print(f"Using device: {device}")
@@ -1338,19 +1935,46 @@ def evaluate(config_path: str) -> None:
     subgroup_rows: list[dict[str, float | str | int]] = []
     selective_rows: list[dict[str, float | str]] = []
     prediction_rows: list[dict[str, float | str | int]] = []
+    significance_rows: list[dict[str, float | str | int]] = []
+    explanation_diagnostic_rows: list[dict[str, float | str | int]] = []
+    rolling_rows: list[dict[str, float | str | int]] = []
     include_selective_analysis = bool(
         config.get("evaluation", {}).get("include_selective_analysis", False)
     )
+    include_modality_ablations = bool(
+        config.get("evaluation", {}).get("include_modality_ablations", False)
+    )
+    baseline_methods = list(
+        config.get("evaluation", {}).get(
+            "strong_baselines",
+            [
+                "market_return",
+                "sector_return",
+                "post_earnings_drift",
+                "analyst_surprise",
+                "implied_vol_only",
+                "linear_ridge",
+                "ticker_fixed_effects",
+                "xgboost_lightgbm_proxy",
+            ],
+        )
+    )
 
-    evaluation_specs: list[tuple[str, str, EventConditionedConformalPredictor]] = [
-        ("text_only", "regime_no_introspection", event_conditioned_predictor),
-        ("financial_only", "regime_no_introspection", event_conditioned_predictor),
-        ("sentiment_only", "regime_no_introspection", event_conditioned_predictor),
+    evaluation_specs: list[tuple[str, str, EventConditionedConformalPredictor]] = []
+    if include_modality_ablations:
+        evaluation_specs.extend(
+            [
+                ("text_only", "regime_no_introspection", event_conditioned_predictor),
+                ("financial_only", "regime_no_introspection", event_conditioned_predictor),
+                ("sentiment_only", "regime_no_introspection", event_conditioned_predictor),
+            ]
+        )
+    evaluation_specs.extend([
         ("full_multimodal", "regime_no_introspection", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
         ("ours", "adaptive", event_conditioned_predictor),
         ("ours_explanation_augmented", "adaptive", explanation_augmented_predictor),
-    ]
+    ])
 
     for method, mode, _active_predictor in evaluation_specs:
         base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
@@ -1380,6 +2004,34 @@ def evaluate(config_path: str) -> None:
             test_sentiment_outputs = outputs
             continue
 
+    if "test_text_outputs" not in locals():
+        test_text_outputs, _unused_labels, _unused_regimes, _unused_tickers = _compute_model_outputs(
+            model=model,
+            events=test_events,
+            dataset=test_dataset,
+            method="text_only",
+            device=device,
+            regime_thresholds=regime_thresholds,
+        )
+    if "test_financial_outputs" not in locals():
+        test_financial_outputs, _unused_labels, _unused_regimes, _unused_tickers = _compute_model_outputs(
+            model=model,
+            events=test_events,
+            dataset=test_dataset,
+            method="financial_only",
+            device=device,
+            regime_thresholds=regime_thresholds,
+        )
+    if "test_sentiment_outputs" not in locals():
+        test_sentiment_outputs, _unused_labels, _unused_regimes, _unused_tickers = _compute_model_outputs(
+            model=model,
+            events=test_events,
+            dataset=test_dataset,
+            method="sentiment_only",
+            device=device,
+            regime_thresholds=regime_thresholds,
+        )
+
     test_metadata, _unused_center, _unused_scale = _build_explanation_metadata(
         events=test_events,
         full_outputs=test_full_outputs,
@@ -1391,14 +2043,19 @@ def evaluate(config_path: str) -> None:
     )
 
     method_payloads: dict[str, tuple[list[dict[str, float]], list[float], list[str], list[str]]] = {
-        "text_only": (test_text_outputs, test_labels, test_regimes, test_tickers),
-        "financial_only": (test_financial_outputs, test_labels, test_regimes, test_tickers),
-        "sentiment_only": (test_sentiment_outputs, test_labels, test_regimes, test_tickers),
         "full_multimodal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "naive_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "ours": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "ours_explanation_augmented": (test_full_outputs, test_labels, test_regimes, test_tickers),
     }
+    if include_modality_ablations:
+        method_payloads.update(
+            {
+                "text_only": (test_text_outputs, test_labels, test_regimes, test_tickers),
+                "financial_only": (test_financial_outputs, test_labels, test_regimes, test_tickers),
+                "sentiment_only": (test_sentiment_outputs, test_labels, test_regimes, test_tickers),
+            }
+        )
 
     for method, mode, active_predictor in evaluation_specs:
         outputs, labels, regimes, _tickers = method_payloads[method]
@@ -1457,60 +2114,102 @@ def evaluate(config_path: str) -> None:
                 global_thresholds=global_thresholds,
                 mode=mode,
                 metadata=test_metadata,
+                events=test_events,
+                sector_lookup=sector_lookup,
             )
         )
 
-    baseline_outputs, baseline_labels, baseline_regimes, _baseline_tickers = _compute_same_ticker_baseline(
-        test_events=test_events,
-        training_events=historical_events,
-        regime_thresholds=regime_thresholds,
-    )
-    results_rows.append(
-        _metric_row(
-            method="same_ticker_baseline",
-            outputs=baseline_outputs,
-            labels=baseline_labels,
-            regimes=baseline_regimes,
-            predictor=event_conditioned_predictor,
-            global_thresholds=global_thresholds,
-            mode="naive",
+    for baseline_method in baseline_methods:
+        cal_baseline_outputs, cal_baseline_labels, _cal_baseline_regimes, _ = _compute_strong_baseline(
+            method=baseline_method,
+            train_events=train_events + val_events,
+            target_events=cal_events,
+            regime_thresholds=regime_thresholds,
+            sector_lookup=sector_lookup,
         )
-    )
-    prediction_rows.extend(
-        _prediction_rows(
-            method="same_ticker_baseline",
-            events=test_events,
-            outputs=baseline_outputs,
-            labels=baseline_labels,
-            regimes=baseline_regimes,
-            tickers=_baseline_tickers,
-            predictor=event_conditioned_predictor,
-            global_thresholds=global_thresholds,
-            mode="naive",
-            financial_lookup=financial_lookup,
+        baseline_thresholds = _baseline_global_thresholds(
+            cal_baseline_outputs,
+            cal_baseline_labels,
+            coverage_levels,
         )
-    )
-    subgroup_rows.extend(
-        _subgroup_metric_rows(
-            method="same_ticker_baseline",
-            outputs=baseline_outputs,
-            labels=baseline_labels,
-            regimes=baseline_regimes,
-            predictor=event_conditioned_predictor,
-            global_thresholds=global_thresholds,
-            mode="naive",
+        baseline_outputs, baseline_labels, baseline_regimes, baseline_tickers = _compute_strong_baseline(
+            method=baseline_method,
+            train_events=historical_events,
+            target_events=test_events,
+            regime_thresholds=regime_thresholds,
+            sector_lookup=sector_lookup,
         )
+        results_rows.append(
+            _metric_row(
+                method=baseline_method,
+                outputs=baseline_outputs,
+                labels=baseline_labels,
+                regimes=baseline_regimes,
+                predictor=event_conditioned_predictor,
+                global_thresholds=baseline_thresholds,
+                mode="naive",
+            )
+        )
+        prediction_rows.extend(
+            _prediction_rows(
+                method=baseline_method,
+                events=test_events,
+                outputs=baseline_outputs,
+                labels=baseline_labels,
+                regimes=baseline_regimes,
+                tickers=baseline_tickers,
+                predictor=event_conditioned_predictor,
+                global_thresholds=baseline_thresholds,
+                mode="naive",
+                financial_lookup=financial_lookup,
+            )
+        )
+        subgroup_rows.extend(
+            _subgroup_metric_rows(
+                method=baseline_method,
+                outputs=baseline_outputs,
+                labels=baseline_labels,
+                regimes=baseline_regimes,
+                predictor=event_conditioned_predictor,
+                global_thresholds=baseline_thresholds,
+                mode="naive",
+                events=test_events,
+                sector_lookup=sector_lookup,
+            )
+        )
+
+    explanation_diagnostic_rows = _explanation_diagnostic_rows(
+        outputs=test_full_outputs,
+        labels=test_labels,
+        metadata=test_metadata,
+        predictor=explanation_augmented_predictor,
+        regimes=test_regimes,
+    )
+    significance_rows = _significance_rows(
+        prediction_rows=prediction_rows,
+        baseline_method=str(config.get("evaluation", {}).get("primary_baseline", "linear_ridge")),
+        n_bootstrap=int(config.get("evaluation", {}).get("bootstrap_samples", 500)),
+    )
+    rolling_rows = _rolling_backtest_rows(
+        events=all_events,
+        config=config,
+        sector_lookup=sector_lookup,
+        baseline_methods=baseline_methods,
     )
 
     results_table = pd.DataFrame(results_rows)
     subgroup_results_table = pd.DataFrame(subgroup_rows)
     selective_results_table = pd.DataFrame(selective_rows)
     predictions_table = pd.DataFrame(prediction_rows)
+    significance_table = pd.DataFrame(significance_rows)
+    explanation_diagnostics_table = pd.DataFrame(explanation_diagnostic_rows)
+    rolling_results_table = pd.DataFrame(rolling_rows)
     display_columns = [
         "method",
         "coverage_80",
         "coverage_90",
         "coverage_95",
+        "mean_abs_coverage_error",
         "avg_width",
         "MAE",
         "RMSE",
@@ -1545,6 +2244,15 @@ def evaluate(config_path: str) -> None:
                 showindex=False,
             )
         )
+    if not significance_table.empty:
+        print(
+            tabulate(
+                significance_table.head(12),
+                headers="keys",
+                tablefmt="github",
+                showindex=False,
+            )
+        )
 
     experiments_results_path = PROJECT_ROOT / "experiments" / "results.csv"
     root_results_path = PROJECT_ROOT / "results.csv"
@@ -1554,12 +2262,24 @@ def evaluate(config_path: str) -> None:
     root_predictions_path = PROJECT_ROOT / "predictions.csv"
     experiments_selective_results_path = PROJECT_ROOT / "experiments" / "results_selective.csv"
     root_selective_results_path = PROJECT_ROOT / "results_selective.csv"
+    experiments_significance_path = PROJECT_ROOT / "experiments" / "results_significance.csv"
+    root_significance_path = PROJECT_ROOT / "results_significance.csv"
+    experiments_explanation_diagnostics_path = PROJECT_ROOT / "experiments" / "explanation_diagnostics.csv"
+    root_explanation_diagnostics_path = PROJECT_ROOT / "explanation_diagnostics.csv"
+    experiments_rolling_results_path = PROJECT_ROOT / "experiments" / "results_rolling.csv"
+    root_rolling_results_path = PROJECT_ROOT / "results_rolling.csv"
     results_table.to_csv(experiments_results_path, index=False)
     results_table.to_csv(root_results_path, index=False)
     subgroup_results_table.to_csv(experiments_subgroup_results_path, index=False)
     subgroup_results_table.to_csv(root_subgroup_results_path, index=False)
     predictions_table.to_csv(experiments_predictions_path, index=False)
     predictions_table.to_csv(root_predictions_path, index=False)
+    significance_table.to_csv(experiments_significance_path, index=False)
+    significance_table.to_csv(root_significance_path, index=False)
+    explanation_diagnostics_table.to_csv(experiments_explanation_diagnostics_path, index=False)
+    explanation_diagnostics_table.to_csv(root_explanation_diagnostics_path, index=False)
+    rolling_results_table.to_csv(experiments_rolling_results_path, index=False)
+    rolling_results_table.to_csv(root_rolling_results_path, index=False)
     if include_selective_analysis:
         selective_results_table.to_csv(experiments_selective_results_path, index=False)
         selective_results_table.to_csv(root_selective_results_path, index=False)
