@@ -220,12 +220,25 @@ def _collate_batch(
         )
         for item in batch
     ]
+
+    # Include LLM signal only when all items in the batch have been annotated
+    has_llm_list = [bool(item.get("has_llm", False)) for item in batch]
+    llm_signal: Tensor | None = None
+    llm_explanations: list[str] | None = None
+    if all(has_llm_list):
+        llm_signal = torch.stack(
+            [item["llm_signal"].float() for item in batch], dim=0
+        )
+        llm_explanations = [str(item.get("llm_explanation", "")) for item in batch]
+
     return {
         "transcripts": transcripts,
         "financial": financial,
         "sentiment": sentiment,
         "labels": labels,
         "regimes": regimes,
+        "llm_signal": llm_signal,
+        "llm_explanations": llm_explanations,
     }
 
 
@@ -233,12 +246,15 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
     """Move tensor batch fields to the target device."""
 
     non_blocking = device.type == "cuda"
+    llm_signal = batch.get("llm_signal")
     return {
         "transcripts": batch["transcripts"],
         "financial": batch["financial"].to(device, non_blocking=non_blocking),
         "sentiment": batch["sentiment"].to(device, non_blocking=non_blocking),
         "labels": batch["labels"].to(device, non_blocking=non_blocking),
         "regimes": batch["regimes"],
+        "llm_signal": llm_signal.to(device, non_blocking=non_blocking) if llm_signal is not None else None,
+        "llm_explanations": batch.get("llm_explanations"),
     }
 
 
@@ -398,6 +414,8 @@ def _run_inference(
                 transcripts=batch["transcripts"],
                 financial=batch["financial"],
                 sentiment=batch["sentiment"],
+                llm_signal=batch.get("llm_signal"),
+                llm_explanations=batch.get("llm_explanations"),
             )
             outputs_list.extend(_serialize_output_batch(outputs))
             labels_list.extend(float(value) for value in batch["labels"].cpu().tolist())
@@ -569,6 +587,8 @@ def train(config_path: str) -> None:
                     transcripts=batch["transcripts"],
                     financial=batch["financial"],
                     sentiment=batch["sentiment"],
+                    llm_signal=batch.get("llm_signal"),
+                    llm_explanations=batch.get("llm_explanations"),
                 )
                 loss = model.loss(outputs, batch["labels"])
             scaler.scale(loss).backward()

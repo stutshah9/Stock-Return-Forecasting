@@ -44,3 +44,14 @@ calibration:
 
 evaluation:
   include_selective_analysis: false
+
+llm_annotator:
+  # HuggingFace model name or local path on ARC
+  model: meta-llama/Meta-Llama-3-8B-Instruct
+  # Path to disk cache for LLM annotations (relative to project root)
+  cache_path: data/llm_annotations.pt
+  # Whether to enable LLM signal during training (requires annotated cache)
+  enabled: false
+  # Quantization options for fitting on ARC GPU memory
+  load_in_4bit: false
+  load_in_8bit: false

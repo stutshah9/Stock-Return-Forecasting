@@ -86,6 +86,24 @@ class CrossModalFusionLayer(nn.Module):
         return torch.cat(updated_tokens, dim=1), attention_maps
 
 
+class LLMSignalEncoder(nn.Module):
+    """Encode LLM-predicted range and confidence into the shared embedding space."""
+
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        # Inputs: [range_low, range_high, confidence]
+        self.network = nn.Sequential(
+            nn.Linear(3, embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        return self.network(x.float())
+
+
 class MultimodalForecastModel(nn.Module):
     """Fuse transcript, financial, and sentiment inputs for quantile forecasting."""
 
@@ -145,6 +163,7 @@ class MultimodalForecastModel(nn.Module):
             embed_dim=self.embed_dim,
             dropout=self.dropout,
         )
+        self.llm_signal_encoder = LLMSignalEncoder(embed_dim=self.embed_dim)
 
         self.fusion_layers = nn.ModuleList(
             [
@@ -271,6 +290,8 @@ class MultimodalForecastModel(nn.Module):
         financial: Tensor | None = None,
         sentiment: Tensor | None = None,
         transcripts: list[str] | None = None,
+        llm_signal: Tensor | None = None,
+        llm_explanations: list[str] | None = None,
         return_explanations: bool = False,
     ) -> dict[str, Any]:
         """Run a forward pass through the multimodal fusion model.
@@ -280,8 +301,15 @@ class MultimodalForecastModel(nn.Module):
             financial: Structured financial inputs with shape ``[B, 3]``.
             sentiment: Aggregated sentiment inputs with shape ``[B, 2]``.
             transcripts: Alias for ``transcript`` for compatibility with callers.
-            return_explanations: Whether to include lightweight natural-language
-                explanation strings in the returned dictionary.
+            llm_signal: Optional LLM-predicted features with shape ``[B, 3]``
+                containing ``[range_low, range_high, confidence]`` (range values
+                in fractional return units).  When provided the LLM confidence
+                replaces the heuristic introspective score and the LLM embedding
+                is added as a residual to the fused representation.
+            llm_explanations: Optional list of LLM explanation strings, one per
+                batch element.  Passed through to the output when available.
+            return_explanations: Whether to include natural-language explanation
+                strings in the returned dictionary.
 
         Returns:
             A dictionary with interval quantiles, attention-derived confidence,
@@ -314,6 +342,13 @@ class MultimodalForecastModel(nn.Module):
             attention_history.append(layer_attention)
         fused_embedding = self.fusion_norm(modality_tokens.mean(dim=1))
 
+        # When LLM signal is available, inject it as a residual on the fused
+        # representation so that the LLM's range prediction can gate all heads.
+        if llm_signal is not None:
+            llm_signal = llm_signal.to(device=device, dtype=torch.float32)
+            llm_emb = self.llm_signal_encoder(llm_signal)
+            fused_embedding = fused_embedding + llm_emb
+
         quantile_params = self.quantile_head(fused_embedding)
         quantile_predictions, _ = torch.sort(quantile_params, dim=-1)
         median_index = self.quantile_levels.index(0.50)
@@ -340,17 +375,23 @@ class MultimodalForecastModel(nn.Module):
         attention_stability = self._attention_stability_score(attention_history)
         modality_consistency = self._modality_consistency_score(modality_tokens)
         interval_confidence = self._interval_confidence(interval_width)
-        confidence_inputs = torch.cat(
-            (
-                explanation_vec,
-                attention_stability.unsqueeze(-1),
-                modality_consistency.unsqueeze(-1),
-            ),
-            dim=-1,
-        )
-        # Keep the introspective head separate from the Gaussian head, then
-        # explicitly regularize agreement in the loss.
-        introspective_score = torch.sigmoid(self.confidence_head(confidence_inputs)).squeeze(-1)
+
+        if llm_signal is not None:
+            # Use the LLM's blended confidence directly as the introspective score.
+            # llm_signal[:, 2] is the pre-computed blended confidence from annotate_event.
+            introspective_score = llm_signal[:, 2].clamp(0.0, 1.0)
+        else:
+            confidence_inputs = torch.cat(
+                (
+                    explanation_vec,
+                    attention_stability.unsqueeze(-1),
+                    modality_consistency.unsqueeze(-1),
+                ),
+                dim=-1,
+            )
+            introspective_score = torch.sigmoid(
+                self.confidence_head(confidence_inputs)
+            ).squeeze(-1)
 
         outputs: dict[str, Any] = {
             "quantile_levels": torch.tensor(
@@ -377,12 +418,19 @@ class MultimodalForecastModel(nn.Module):
                 for layer_attention in attention_history
             ),
         }
+        if llm_signal is not None:
+            outputs["llm_range_low"] = llm_signal[:, 0]
+            outputs["llm_range_high"] = llm_signal[:, 1]
+            outputs["llm_confidence"] = llm_signal[:, 2]
         if return_explanations:
-            outputs["explanations"] = self._build_explanations(
-                mu=mu,
-                interval_width=interval_width,
-                modality_tokens=modality_tokens,
-            )
+            if llm_explanations is not None:
+                outputs["explanations"] = llm_explanations
+            else:
+                outputs["explanations"] = self._build_explanations(
+                    mu=mu,
+                    interval_width=interval_width,
+                    modality_tokens=modality_tokens,
+                )
         return outputs
 
     def _attention_stability_score(self, attention_history: list[list[Tensor]]) -> Tensor:

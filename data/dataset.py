@@ -110,6 +110,16 @@ class EarningsDataset(Dataset):
         sentiment = torch.tensor(sentiment_values, dtype=torch.float32)
         label = torch.tensor(label_value, dtype=torch.float32)
 
+        llm_range_low = float(event.get("llm_range_low", 0.0))
+        llm_range_high = float(event.get("llm_range_high", 0.0))
+        llm_confidence = float(event.get("llm_confidence", 0.5))
+        llm_signal = torch.tensor(
+            [llm_range_low, llm_range_high, llm_confidence],
+            dtype=torch.float32,
+        )
+        llm_explanation = str(event.get("llm_explanation", ""))
+        has_llm = bool(event.get("llm_explanation") is not None and event.get("llm_range_low") is not None)
+
         return {
             "ticker": str(event.get("ticker", "")),
             "date": str(event.get("date", "")),
@@ -119,4 +129,7 @@ class EarningsDataset(Dataset):
             "raw_features": raw,
             "sentiment": sentiment,
             "label": label,
+            "llm_signal": llm_signal,
+            "llm_explanation": llm_explanation,
+            "has_llm": has_llm,
         }
