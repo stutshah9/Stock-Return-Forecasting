@@ -242,6 +242,7 @@ class MultimodalForecastModel(nn.Module):
         explanation_vec = self.explanation_head(fused_embedding)
         attention_stability = self._attention_stability_score(attention_history)
         modality_consistency = self._modality_consistency_score(modality_tokens)
+        modality_strength = modality_tokens.norm(dim=-1)
         variance_confidence = self._variance_confidence(log_sigma)
         confidence_inputs = torch.cat(
             (
@@ -263,6 +264,7 @@ class MultimodalForecastModel(nn.Module):
             "explanation_vec": explanation_vec,
             "attention_stability": attention_stability,
             "modality_consistency": modality_consistency,
+            "modality_strengths": modality_strength,
             "variance_confidence": variance_confidence,
             "introspective_score": introspective_score,
             "attention_weights": tuple(

@@ -343,6 +343,72 @@ def _explanation_confidence_from_disagreement(
     return float(1.0 / (1.0 + math.exp(normalized)))
 
 
+def _bounded_unit(value: float) -> float:
+    """Clamp a numeric score into the unit interval."""
+
+    if not math.isfinite(float(value)):
+        return 0.5
+    return float(min(max(float(value), 0.0), 1.0))
+
+
+def _direction_match_score(reference: float, candidate: float, neutral_band: float = 1e-6) -> float:
+    """Score whether two signed signals agree, treating tiny values as neutral."""
+
+    if abs(float(reference)) <= neutral_band or abs(float(candidate)) <= neutral_band:
+        return 0.5
+    return 1.0 if math.copysign(1.0, float(reference)) == math.copysign(1.0, float(candidate)) else 0.0
+
+
+def _evidence_direction_alignment(event: dict[str, Any], full_mu: float) -> float:
+    """Check whether observable financial/sentiment evidence supports the forecast sign."""
+
+    sue, momentum, _implied_vol = _feature_triplet(event)
+    avg_sentiment, _message_volume = _sentiment_pair(event)
+    signals = [sue, momentum, avg_sentiment]
+    scored_signals = [
+        _direction_match_score(full_mu, signal)
+        for signal in signals
+        if abs(float(signal)) > 1e-6
+    ]
+    if not scored_signals:
+        return 0.5
+    return float(np.mean(scored_signals))
+
+
+def _dominant_modality_alignment(
+    full_output: dict[str, float],
+    text_output: dict[str, float],
+    financial_output: dict[str, float],
+    sentiment_output: dict[str, float],
+) -> tuple[float, str, float]:
+    """Check whether the explanation's dominant modality agrees with the full forecast."""
+
+    modality_names = ("text", "financial", "sentiment")
+    strengths = [
+        float(full_output.get("text_strength", 0.0)),
+        float(full_output.get("financial_strength", 0.0)),
+        float(full_output.get("sentiment_strength", 0.0)),
+    ]
+    if not any(math.isfinite(value) and value > 0.0 for value in strengths):
+        return 0.5, "unknown", 0.0
+
+    strength_array = np.asarray(strengths, dtype=float)
+    dominant_index = int(np.argmax(strength_array))
+    total_strength = float(np.sum(np.maximum(strength_array, 0.0)))
+    dominance_margin = 0.0
+    if total_strength > 1e-8:
+        sorted_strengths = np.sort(strength_array)
+        dominance_margin = float((sorted_strengths[-1] - sorted_strengths[-2]) / total_strength)
+
+    branch_outputs = (text_output, financial_output, sentiment_output)
+    dominant_mu = float(branch_outputs[dominant_index]["mu"])
+    return (
+        _direction_match_score(float(full_output["mu"]), dominant_mu),
+        modality_names[dominant_index],
+        _bounded_unit(dominance_margin),
+    )
+
+
 def _build_explanation_metadata(
     events: list[dict[str, Any]],
     full_outputs: list[dict[str, float]],
@@ -351,8 +417,8 @@ def _build_explanation_metadata(
     sentiment_outputs: list[dict[str, float]],
     reference_center: float | None = None,
     reference_scale: float | None = None,
-) -> tuple[list[dict[str, float]], float, float]:
-    """Build metadata with learned confidence plus disagreement as an auxiliary cue."""
+) -> tuple[list[dict[str, float | str]], float, float]:
+    """Build metadata with structurally grounded explanation-confidence signals."""
 
     if not (
         len(events)
@@ -388,24 +454,63 @@ def _build_explanation_metadata(
         scale = float(reference_scale)
     scale = max(scale, 1e-6)
 
-    metadata_rows: list[dict[str, float]] = []
-    for event, disagreement, full_output in zip(events, disagreements, full_outputs):
+    metadata_rows: list[dict[str, float | str]] = []
+    for (
+        event,
+        disagreement,
+        full_output,
+        text_output,
+        financial_output,
+        sentiment_output,
+    ) in zip(
+        events,
+        disagreements,
+        full_outputs,
+        text_outputs,
+        financial_outputs,
+        sentiment_outputs,
+    ):
         base_metadata = _event_calibration_metadata(event)
         disagreement_confidence = _explanation_confidence_from_disagreement(
             disagreement=disagreement,
             center=center,
             scale=scale,
         )
-        model_confidence = float(full_output.get("introspective_score", 0.5))
+        model_confidence = _bounded_unit(float(full_output.get("introspective_score", 0.5)))
+        modality_consistency = _bounded_unit(float(full_output.get("modality_consistency", 0.5)))
+        variance_confidence = _bounded_unit(float(full_output.get("variance_confidence", 0.5)))
+        dominant_alignment, dominant_modality, dominance_margin = _dominant_modality_alignment(
+            full_output=full_output,
+            text_output=text_output,
+            financial_output=financial_output,
+            sentiment_output=sentiment_output,
+        )
+        evidence_alignment = _evidence_direction_alignment(
+            event=event,
+            full_mu=float(full_output["mu"]),
+        )
+        explanation_grounding_score = _bounded_unit(
+            0.30 * model_confidence
+            + 0.20 * disagreement_confidence
+            + 0.15 * modality_consistency
+            + 0.15 * variance_confidence
+            + 0.10 * dominant_alignment
+            + 0.10 * evidence_alignment
+        )
         metadata_rows.append(
             {
                 **base_metadata,
                 "modality_disagreement": float(disagreement),
                 "disagreement_confidence": float(disagreement_confidence),
                 "model_confidence": model_confidence,
-                "explanation_confidence": float(
-                    min(max(0.7 * model_confidence + 0.3 * disagreement_confidence, 0.0), 1.0)
-                ),
+                "modality_consistency": modality_consistency,
+                "variance_confidence": variance_confidence,
+                "dominant_modality_alignment": float(dominant_alignment),
+                "dominant_modality": dominant_modality,
+                "dominance_margin": float(dominance_margin),
+                "evidence_direction_alignment": float(evidence_alignment),
+                "explanation_grounding_score": float(explanation_grounding_score),
+                "explanation_confidence": float(explanation_grounding_score),
             }
         )
     return metadata_rows, center, scale
@@ -548,6 +653,7 @@ def _compute_model_outputs(
     attention_values = batch_outputs.get("attention_stability")
     variance_values = batch_outputs.get("variance_confidence")
     modality_values = batch_outputs.get("modality_consistency")
+    modality_strength_values = batch_outputs.get("modality_strengths")
     attention_list = (
         attention_values.cpu().tolist()
         if attention_values is not None
@@ -563,15 +669,32 @@ def _compute_model_outputs(
         if modality_values is not None
         else [0.0 for _ in batch_outputs["mu"].cpu().tolist()]
     )
+    modality_strength_list = (
+        modality_strength_values.cpu().tolist()
+        if modality_strength_values is not None
+        else [[0.0, 0.0, 0.0] for _ in batch_outputs["mu"].cpu().tolist()]
+    )
 
-    for mu, log_sigma, score, attention, variance_confidence, modality_consistency in zip(
+    for (
+        mu,
+        log_sigma,
+        score,
+        attention,
+        variance_confidence,
+        modality_consistency,
+        modality_strengths,
+    ) in zip(
         batch_outputs["mu"].cpu().tolist(),
         batch_outputs["log_sigma"].cpu().tolist(),
         batch_outputs["introspective_score"].cpu().tolist(),
         attention_list,
         variance_list,
         modality_list,
+        modality_strength_list,
     ):
+        strength_values = [float(value) for value in list(modality_strengths)[:3]]
+        while len(strength_values) < 3:
+            strength_values.append(0.0)
         outputs.append(
             {
                 "mu": float(mu),
@@ -580,6 +703,9 @@ def _compute_model_outputs(
                 "attention_stability": float(attention),
                 "variance_confidence": float(variance_confidence),
                 "modality_consistency": float(modality_consistency),
+                "text_strength": strength_values[0],
+                "financial_strength": strength_values[1],
+                "sentiment_strength": strength_values[2],
             }
         )
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
@@ -967,8 +1093,40 @@ def _prediction_rows(
                         output.get("introspective_score", 0.0),
                     )
                 ),
+                "explanation_grounding_score": float(
+                    event_metadata.get(
+                        "explanation_grounding_score",
+                        event_metadata.get(
+                            "explanation_confidence",
+                            output.get("introspective_score", 0.0),
+                        ),
+                    )
+                ),
                 "modality_disagreement": float(
                     event_metadata.get("modality_disagreement", 0.0)
+                ),
+                "disagreement_confidence": float(
+                    event_metadata.get("disagreement_confidence", 0.0)
+                ),
+                "modality_consistency": float(
+                    event_metadata.get(
+                        "modality_consistency",
+                        output.get("modality_consistency", 0.0),
+                    )
+                ),
+                "variance_confidence": float(
+                    event_metadata.get(
+                        "variance_confidence",
+                        output.get("variance_confidence", 0.0),
+                    )
+                ),
+                "dominant_modality": str(event_metadata.get("dominant_modality", "")),
+                "dominant_modality_alignment": float(
+                    event_metadata.get("dominant_modality_alignment", 0.0)
+                ),
+                "dominance_margin": float(event_metadata.get("dominance_margin", 0.0)),
+                "evidence_direction_alignment": float(
+                    event_metadata.get("evidence_direction_alignment", 0.0)
                 ),
                 "direction_match": int(np.sign(mu) == np.sign(float(label))),
                 "transcript_preview": transcript_preview,

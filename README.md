@@ -212,6 +212,15 @@ This evaluates:
 - `ours_explanation_augmented`
 - `same_ticker_baseline`
 
+`ours` is the main event-conditioned conformal method. It conditions interval
+thresholds on observable event regimes and attention-volume bands.
+`ours_explanation_augmented` is an ablation that additionally uses an
+explanation-grounding score to widen intervals when the explanation is poorly
+supported by independent model and evidence signals. That score combines model
+confidence, cross-modality disagreement, modality consistency, variance
+confidence, dominant-modality direction agreement, and financial/sentiment
+direction agreement. It is not a raw fluency or self-reported confidence score.
+
 The script prints a results table with:
 
 - `coverage_80`
@@ -248,6 +257,12 @@ It also exports per-event test predictions to:
 ```text
 experiments/predictions.csv
 ```
+
+Those prediction rows include `explanation_grounding_score` plus its component
+diagnostics: `disagreement_confidence`, `modality_consistency`,
+`variance_confidence`, `dominant_modality`,
+`dominant_modality_alignment`, `dominance_margin`, and
+`evidence_direction_alignment`.
 
 Compatibility artifact also saved to project root:
 

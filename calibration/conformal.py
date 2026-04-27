@@ -173,15 +173,21 @@ def _message_volume(metadata: Any) -> float:
 
 
 def _confidence_score(output: dict[str, Any], metadata: Any) -> float:
-    """Extract a confidence score, preferring the model score and blending auxiliaries."""
+    """Extract a confidence score, preferring grounded explanation metadata."""
 
     model_score = None
     if "introspective_score" in output:
         model_score = min(max(_to_float(output.get("introspective_score", 0.5)), 0.0), 1.0)
 
     metadata_score = None
-    if isinstance(metadata, dict) and "explanation_confidence" in metadata:
-        metadata_score = min(max(_to_float(metadata["explanation_confidence"]), 0.0), 1.0)
+    if isinstance(metadata, dict):
+        if "explanation_grounding_score" in metadata:
+            return float(min(
+                max(_to_float(metadata["explanation_grounding_score"]), 0.0),
+                1.0,
+            ))
+        elif "explanation_confidence" in metadata:
+            metadata_score = min(max(_to_float(metadata["explanation_confidence"]), 0.0), 1.0)
 
     if model_score is not None and metadata_score is not None:
         return float(0.7 * model_score + 0.3 * metadata_score)
