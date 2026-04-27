@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/experimenting",
+  "result_branch": "falcon-results/experimenting-20260427",
+  "label": "experimenting",
+  "start_utc": "2026-04-27T17:14:09Z",
+  "end_utc": "2026-04-27T17:16:47Z",
+  "exit_code": 0,
+  "slurm_job_id": "379293",
+  "host": "fal006",
+  "source_commit": "023ceff5a49761698f7e5e63b5a62da7b16ea52f"
+}
