@@ -499,7 +499,7 @@ def train(config_path: str) -> None:
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
     )
@@ -530,6 +530,11 @@ def train(config_path: str) -> None:
         lr=float(training_config.get("lr", 1e-4)),
         weight_decay=1e-4,
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=float(training_config.get("lr", 1e-4)) * 0.05,
+    )
     scaler = _make_grad_scaler(
         device_type=device.type,
         enabled=device.type == "cuda" and use_amp,
@@ -539,7 +544,7 @@ def train(config_path: str) -> None:
     best_epoch = 0
     best_val_metrics: dict[str, float] = {}
     patience_counter = 0
-    PATIENCE = 5
+    PATIENCE = int(training_config.get("patience", 8))
     validation_history: list[dict[str, float | int]] = []
 
     for epoch_index in range(epochs):
@@ -614,6 +619,7 @@ def train(config_path: str) -> None:
                 "val_rmse": float(val_rmse),
             }
         )
+        scheduler.step()
         model.train()
 
         current_score = {
