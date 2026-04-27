@@ -154,3 +154,4 @@ CUDA memory after warmup: allocated=423.75 MB, reserved=472.00 MB
 --- complete ---
 end_utc=2026-04-27T17:19:20Z
 exit_code=0
+Push skipped on Falcon: HTTPS GitHub credentials are not available here.
