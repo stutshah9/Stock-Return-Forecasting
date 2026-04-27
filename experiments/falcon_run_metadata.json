@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/explanation-confidence",
+  "result_branch": "falcon-results/explanation-confidence-20260427",
+  "label": "explanation_confidence",
+  "start_utc": "2026-04-27T17:17:14Z",
+  "end_utc": "2026-04-27T17:19:54Z",
+  "exit_code": 0,
+  "slurm_job_id": "379298",
+  "host": "fal008",
+  "source_commit": "61bdd0f928d54d582590747ae09745d709bd8d7c"
+}
