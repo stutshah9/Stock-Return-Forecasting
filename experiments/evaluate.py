@@ -1455,7 +1455,7 @@ def evaluate(config_path: str) -> None:
         ("text_only", "raw_quantile", event_conditioned_predictor),
         ("financial_only", "raw_quantile", event_conditioned_predictor),
         ("sentiment_only", "raw_quantile", event_conditioned_predictor),
-        ("full_multimodal", "raw_quantile", event_conditioned_predictor),
+        ("full_multimodal", "naive", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
         ("ours_adaptive", "adaptive", event_conditioned_predictor),
     ]
