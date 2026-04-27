@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/TA_recommendations",
+  "result_branch": "falcon-results/ta-recommendations-20260427",
+  "label": "TA_recommendations",
+  "start_utc": "2026-04-27T17:16:49Z",
+  "end_utc": "2026-04-27T17:19:20Z",
+  "exit_code": 0,
+  "slurm_job_id": "379297",
+  "host": "fal006",
+  "source_commit": "5cf24df49baca024e9838d7d9c9d332603f70eb2"
+}
