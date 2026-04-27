@@ -78,8 +78,14 @@ def main() -> None:
     assert "early_stop_metric" in training_summary, "training summary missing early_stop_metric"
     assert "best_epoch" in training_summary, "training summary missing best_epoch"
     assert "best_metrics" in training_summary, "training summary missing best_metrics"
+    assert "test_metrics" in training_summary, "training summary missing test_metrics"
     assert "history" in training_summary, "training summary missing history"
     assert isinstance(training_summary["history"], list), "training summary history must be a list"
+    for metric_name in ("accuracy", "precision", "recall", "f1"):
+        assert metric_name in training_summary["test_metrics"], f"test_metrics missing {metric_name}"
+        assert 0.0 <= training_summary["test_metrics"][metric_name] <= 1.0, (
+            f"test_metrics.{metric_name} must be in [0, 1]"
+        )
 
     print("All training tests passed.")
 

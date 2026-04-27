@@ -379,6 +379,47 @@ def _serialize_output_batch(outputs: dict[str, Tensor]) -> list[dict[str, float]
     return serialized
 
 
+def _point_prediction(output: dict[str, float]) -> float:
+    """Read the point forecast used for directional test metrics."""
+
+    return float(output.get("point_mu", output["mu"]))
+
+
+def _binary_direction_metrics(
+    predictions: list[float],
+    labels: list[float],
+) -> dict[str, float | int]:
+    """Compute binary up/down test metrics from return signs."""
+
+    predicted_positive = [float(value) >= 0.0 for value in predictions]
+    actual_positive = [float(value) >= 0.0 for value in labels]
+
+    tp = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if pred and actual)
+    tn = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if not pred and not actual)
+    fp = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if pred and not actual)
+    fn = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if not pred and actual)
+    total = len(labels)
+
+    accuracy = (tp + tn) / total if total else float("nan")
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "support": int(total),
+        "positive_support": int(sum(actual_positive)),
+        "negative_support": int(total - sum(actual_positive)),
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn),
+    }
+
+
 def _run_inference(
     model: MultimodalForecastModel,
     data_loader: DataLoader,
@@ -644,7 +685,36 @@ def train(config_path: str) -> None:
         model.to(device)
 
     cal_outputs, cal_labels, cal_regimes = _run_inference(model, cal_loader, device)
-    _run_inference(model, test_loader, device)
+    test_outputs, test_labels, _test_regimes = _run_inference(model, test_loader, device)
+    test_predictions = [_point_prediction(output) for output in test_outputs]
+    test_mae = float(
+        np.mean([abs(prediction - label) for prediction, label in zip(test_predictions, test_labels)])
+    )
+    test_rmse = float(
+        np.sqrt(
+            np.mean(
+                [
+                    (prediction - label) ** 2
+                    for prediction, label in zip(test_predictions, test_labels)
+                ]
+            )
+        )
+    )
+    test_metrics = {
+        "mae": test_mae,
+        "rmse": test_rmse,
+        **_binary_direction_metrics(test_predictions, test_labels),
+    }
+    print(
+        "Test metrics: "
+        f"n={test_metrics['support']} "
+        f"mae={test_metrics['mae']:.4f} "
+        f"rmse={test_metrics['rmse']:.4f} "
+        f"accuracy={test_metrics['accuracy']:.4f} "
+        f"precision={test_metrics['precision']:.4f} "
+        f"recall={test_metrics['recall']:.4f} "
+        f"f1={test_metrics['f1']:.4f}"
+    )
 
     data_output_path = PROJECT_ROOT / "data" / "cal_outputs.pt"
     model_output_path = PROJECT_ROOT / "experiments" / "model.pt"
@@ -661,6 +731,7 @@ def train(config_path: str) -> None:
         "best_val_score": float(best_val_score),
         "best_epoch": int(best_epoch),
         "best_metrics": best_val_metrics,
+        "test_metrics": test_metrics,
         "history": validation_history,
     }
     torch.save(saved_calibration, data_output_path)

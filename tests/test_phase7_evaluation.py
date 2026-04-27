@@ -45,12 +45,18 @@ def main() -> None:
 
     results_path = os.path.join(root, "results.csv")
     assert os.path.isfile(results_path), "results.csv must exist after evaluation"
+    test_results_path = os.path.join(root, "test_results.csv")
+    assert os.path.isfile(test_results_path), "test_results.csv must exist after evaluation"
     subgroup_results_path = os.path.join(root, "results_by_subgroup.csv")
     assert os.path.isfile(
         subgroup_results_path
     ), "results_by_subgroup.csv must exist after evaluation"
     predictions_path = os.path.join(root, "predictions.csv")
     assert os.path.isfile(predictions_path), "predictions.csv must exist after evaluation"
+    test_predictions_path = os.path.join(root, "test_predictions.csv")
+    assert os.path.isfile(
+        test_predictions_path
+    ), "test_predictions.csv must exist after evaluation"
     results = pd.read_csv(results_path)
     subgroup_results = pd.read_csv(subgroup_results_path)
     predictions = pd.read_csv(predictions_path)
@@ -70,6 +76,10 @@ def main() -> None:
         "avg_width_90",
         "avg_width_95",
         "dir_acc",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
         "avg_explanation_confidence",
         "avg_predicted_variance_proxy",
         "avg_variance_weighted_explanation_error",
@@ -88,6 +98,9 @@ def main() -> None:
 
     assert (results["dir_acc"] >= 0.0).all(), "dir_acc must be >= 0"
     assert (results["dir_acc"] <= 1.0).all(), "dir_acc must be <= 1"
+    for metric_column in ("accuracy", "precision", "recall", "f1"):
+        assert (results[metric_column] >= 0.0).all(), f"{metric_column} must be >= 0"
+        assert (results[metric_column] <= 1.0).all(), f"{metric_column} must be <= 1"
 
     subgroup_required_columns = [
         "method",

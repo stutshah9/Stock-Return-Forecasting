@@ -440,6 +440,41 @@ def _prediction_variance_proxy(output: dict[str, Any]) -> float:
     return float(half_width ** 2)
 
 
+def _binary_direction_metrics(
+    predictions: list[float],
+    labels: list[float],
+) -> dict[str, float | int]:
+    """Compute binary up/down test metrics from return signs."""
+
+    predicted_positive = [float(value) >= 0.0 for value in predictions]
+    actual_positive = [float(value) >= 0.0 for value in labels]
+
+    tp = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if pred and actual)
+    tn = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if not pred and not actual)
+    fp = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if pred and not actual)
+    fn = sum(1 for pred, actual in zip(predicted_positive, actual_positive) if not pred and actual)
+    total = len(labels)
+
+    accuracy = (tp + tn) / total if total else float("nan")
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "support": int(total),
+        "positive_support": int(sum(actual_positive)),
+        "negative_support": int(total - sum(actual_positive)),
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn),
+    }
+
+
 def _output_interval_bounds(output: dict[str, Any]) -> tuple[float, float]:
     """Read an ordered interval from serialized model outputs."""
 
@@ -924,6 +959,7 @@ def _metric_row(
     mu_values = [_point_prediction_for_method(output, method) for output in outputs]
     mae = float(np.mean([abs(mu - y) for mu, y in zip(mu_values, labels)]))
     rmse = float(np.sqrt(np.mean([(mu - y) ** 2 for mu, y in zip(mu_values, labels)])))
+    classification_metrics = _binary_direction_metrics(mu_values, labels)
     if method == "same_ticker_baseline":
         dir_acc = float(
             np.mean(
@@ -1014,6 +1050,17 @@ def _metric_row(
         "MAE": mae,
         "RMSE": rmse,
         "dir_acc": dir_acc,
+        "accuracy": classification_metrics["accuracy"],
+        "precision": classification_metrics["precision"],
+        "recall": classification_metrics["recall"],
+        "f1": classification_metrics["f1"],
+        "support": classification_metrics["support"],
+        "positive_support": classification_metrics["positive_support"],
+        "negative_support": classification_metrics["negative_support"],
+        "tp": classification_metrics["tp"],
+        "fp": classification_metrics["fp"],
+        "tn": classification_metrics["tn"],
+        "fn": classification_metrics["fn"],
         "avg_explanation_confidence": float(np.mean(explanation_confidences)) if explanation_confidences else float("nan"),
         "avg_llm_stated_confidence": float(np.mean(llm_stated_confidences)) if llm_stated_confidences else float("nan"),
         "avg_predicted_variance_proxy": float(np.mean(variance_values)) if variance_values else float("nan"),
@@ -1343,6 +1390,17 @@ def evaluate(config_path: str) -> None:
     except Exception as exc:
         raise ValueError(f"Could not build the requested evaluation split. {exc}") from exc
     _assert_disjoint_splits(train_events, val_events, cal_events, test_events)
+    print(
+        "Split sizes: "
+        f"train={len(train_events)} "
+        f"validation={len(val_events)} "
+        f"calibration={len(cal_events)} "
+        f"test={len(test_events)}"
+    )
+    print(
+        "Evaluating held-out test split "
+        f"for years={split_config.get('test_years', [2025])}."
+    )
     regime_thresholds = _load_regime_thresholds(config, train_events + val_events)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
@@ -1695,6 +1753,10 @@ def evaluate(config_path: str) -> None:
         "MAE",
         "RMSE",
         "dir_acc",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
     ]
     print(tabulate(results_table[display_columns], headers="keys", tablefmt="github", showindex=False))
     if not subgroup_results_table.empty:
@@ -1728,18 +1790,26 @@ def evaluate(config_path: str) -> None:
 
     experiments_results_path = PROJECT_ROOT / "experiments" / "results.csv"
     root_results_path = PROJECT_ROOT / "results.csv"
+    experiments_test_results_path = PROJECT_ROOT / "experiments" / "test_results.csv"
+    root_test_results_path = PROJECT_ROOT / "test_results.csv"
     experiments_subgroup_results_path = PROJECT_ROOT / "experiments" / "results_by_subgroup.csv"
     root_subgroup_results_path = PROJECT_ROOT / "results_by_subgroup.csv"
     experiments_predictions_path = PROJECT_ROOT / "experiments" / "predictions.csv"
     root_predictions_path = PROJECT_ROOT / "predictions.csv"
+    experiments_test_predictions_path = PROJECT_ROOT / "experiments" / "test_predictions.csv"
+    root_test_predictions_path = PROJECT_ROOT / "test_predictions.csv"
     experiments_selective_results_path = PROJECT_ROOT / "experiments" / "results_selective.csv"
     root_selective_results_path = PROJECT_ROOT / "results_selective.csv"
     results_table.to_csv(experiments_results_path, index=False)
     results_table.to_csv(root_results_path, index=False)
+    results_table.to_csv(experiments_test_results_path, index=False)
+    results_table.to_csv(root_test_results_path, index=False)
     subgroup_results_table.to_csv(experiments_subgroup_results_path, index=False)
     subgroup_results_table.to_csv(root_subgroup_results_path, index=False)
     predictions_table.to_csv(experiments_predictions_path, index=False)
     predictions_table.to_csv(root_predictions_path, index=False)
+    predictions_table.to_csv(experiments_test_predictions_path, index=False)
+    predictions_table.to_csv(root_test_predictions_path, index=False)
     if include_selective_analysis:
         selective_results_table.to_csv(experiments_selective_results_path, index=False)
         selective_results_table.to_csv(root_selective_results_path, index=False)
