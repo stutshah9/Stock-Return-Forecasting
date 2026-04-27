@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/fix_attempt_-full-multimodal_coverage",
+  "result_branch": "falcon-results/full-multimodal-coverage-20260427",
+  "label": "fix_attempt_full_multimodal_coverage",
+  "start_utc": "2026-04-27T17:14:11Z",
+  "end_utc": "2026-04-27T17:17:36Z",
+  "exit_code": 0,
+  "slurm_job_id": "379296",
+  "host": "fal014",
+  "source_commit": "239c4bea8fbad3368359eb85889893ce619c8246"
+}
