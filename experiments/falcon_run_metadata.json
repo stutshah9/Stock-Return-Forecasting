@@ -1,0 +1,11 @@
+{
+  "source_ref": "origin/main",
+  "result_branch": "falcon-results/main-20260427",
+  "label": "main",
+  "start_utc": "2026-04-27T17:14:09Z",
+  "end_utc": "2026-04-27T17:17:12Z",
+  "exit_code": 0,
+  "slurm_job_id": "379292",
+  "host": "fal008",
+  "source_commit": "339003c8dd984114ba62567f21075e7982668913"
+}
