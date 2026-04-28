@@ -445,18 +445,44 @@ done
 - `experiments/evaluate.py`: evaluation entry point
 
 # upload data to ARC
-rsync -avh --progress /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
+rsync -avh --progress \
+  --exclude '.git/' \
+  --exclude '.venv/' \
+  --exclude 'data/transcript_cache/' \
+  --exclude 'data/transcript_cache_eval_resume/' \
+  --exclude '*.sbatch' \
+  --exclude '*.slurm' \
+  --exclude 'slurm-*.out' \
+  --exclude 'slurm-*.err' \
+  --exclude 'results.csv' \
+  --exclude 'predictions.csv' \
+  --exclude 'results_by_subgroup.csv' \
+  --exclude 'experiments/results.csv' \
+  --exclude 'experiments/predictions.csv' \
+  --exclude 'experiments/results_by_subgroup.csv' \
+  /Users/Stuti/Stock-Return-Forecasting/ \
+  stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
-srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:l40s:1      --pty bash -l
+srun --account=cp-spring2026-iac      --partition=a30_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:a30:1      --pty bash -l
 source .venv/bin/activate
 cd earnings_forecast/
 python3 experiments/train.py
 python3 experiments/evaluate.py
 
 # pull data from ARC
-rsync -avh --progress stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ /Users/Stuti/Stock-Return-Forecasting/
+rsync -avh --progress \
+  --exclude '.git/' \
+  --exclude '.venv/' \
+  --exclude 'data/transcript_cache/' \
+  --exclude 'data/transcript_cache_eval_resume/' \
+  --exclude '*.sbatch' \
+  --exclude '*.slurm' \
+  --exclude 'slurm-*.out' \
+  --exclude 'slurm-*.err' \
+  stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/ \
+  /Users/Stuti/Stock-Return-Forecasting/
 
 # run frontend locally
 python3 -m pip install gradio

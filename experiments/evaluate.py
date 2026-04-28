@@ -28,9 +28,11 @@ from calibration.conformal import (
 )
 from data.dataset import EarningsDataset
 from data.event_utils import (
+    build_synthetic_events as _shared_build_synthetic_events,
     filter_events_by_universe,
     summarize_event_coverage,
 )
+from encoders.sentiment_encoder import aggregate_posts
 from models.fusion_model import MultimodalForecastModel
 
 
@@ -119,6 +121,40 @@ def _load_cached_events() -> list[dict[str, Any]]:
     if not isinstance(events, list):
         raise ValueError("data/events_cache.pt must contain a list of event dictionaries.")
     return events
+
+
+def _build_synthetic_fallback_events() -> list[dict[str, Any]]:
+    """Build a tiny year-split event set for evaluation smoke tests."""
+
+    normalized_events: list[dict[str, Any]] = []
+    fallback_years = [2021, 2022, 2023, 2024, 2025, 2025]
+    for index, event in enumerate(_shared_build_synthetic_events()):
+        raw_posts = [str(post) for post in list(event.get("sentiment_posts", []))]
+        sentiment_features = aggregate_posts(raw_posts)
+        raw_features = event.get("features", {})
+        original_date = str(event.get("date", "2023-01-01"))
+        adjusted_year = fallback_years[min(index, len(fallback_years) - 1)]
+        adjusted_date = f"{adjusted_year}{original_date[4:]}"
+        normalized_events.append(
+            {
+                "ticker": str(event.get("ticker", "")).upper(),
+                "date": adjusted_date,
+                "transcript": str(event.get("transcript", "")),
+                "features": [
+                    float(raw_features.get("sue", 0.0)),
+                    float(raw_features.get("momentum", 0.0)),
+                    float(raw_features.get("implied_vol", 0.0)),
+                ],
+                "sentiment_raw": raw_posts,
+                "sentiment_features": [
+                    float(sentiment_features[0].item()),
+                    float(sentiment_features[1].item()),
+                ],
+                "label": float(event.get("label", 0.0)),
+                "year": adjusted_year,
+            }
+        )
+    return normalized_events
 
 
 def _load_feature_stats() -> dict[str, list[float]]:
@@ -340,6 +376,7 @@ def _explanation_confidence_from_disagreement(
     """Map modality disagreement to a bounded confidence score."""
 
     normalized = (float(disagreement) - float(center)) / max(float(scale), 1e-6)
+    normalized = min(max(normalized, -50.0), 50.0)
     return float(1.0 / (1.0 + math.exp(normalized)))
 
 
@@ -403,6 +440,7 @@ def _build_explanation_metadata(
                 "modality_disagreement": float(disagreement),
                 "disagreement_confidence": float(disagreement_confidence),
                 "model_confidence": model_confidence,
+                "llm_confidence": model_confidence,
                 "explanation_confidence": float(
                     min(max(0.7 * model_confidence + 0.3 * disagreement_confidence, 0.0), 1.0)
                 ),
@@ -496,6 +534,49 @@ def _build_global_thresholds(
 
     thresholds: dict[float, float] = {}
     n = len(scores)
+    for coverage in coverage_levels:
+        quantile_level = coverage * (1.0 + 1.0 / n)
+        thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
+    return thresholds
+
+
+def _confidence_variance_normalizer(
+    output: dict[str, Any],
+    explanation_confidence: float,
+) -> float:
+    """Return the confidence-times-variance scale used by normalized conformal."""
+
+    confidence = min(max(float(explanation_confidence), 0.05), 0.95)
+    variance = max(_prediction_variance_proxy(output), 1e-6)
+    return float(max(confidence * variance, 1e-9))
+
+
+def _build_confidence_variance_thresholds(
+    cal_outputs: list[dict[str, Any]],
+    cal_labels: list[float],
+    cal_metadata: list[dict[str, float]],
+    coverage_levels: list[float],
+    reference_explanation_confidence: float,
+) -> dict[float, float]:
+    """Calibrate residuals normalized by LLM confidence times variance."""
+
+    scores: list[float] = []
+    for output, label, event_metadata in zip(cal_outputs, cal_labels, cal_metadata):
+        mu = _point_prediction_for_method(output, "ours")
+        explanation_confidence = float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", reference_explanation_confidence),
+            )
+        )
+        normalizer = _confidence_variance_normalizer(
+            output=output,
+            explanation_confidence=explanation_confidence,
+        )
+        scores.append(abs(float(label) - mu) / normalizer)
+
+    thresholds: dict[float, float] = {}
+    n = max(len(scores), 1)
     for coverage in coverage_levels:
         quantile_level = coverage * (1.0 + 1.0 / n)
         thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
@@ -782,41 +863,35 @@ def _predict_interval_confidence_scaled_naive(
     explanation_confidence: float,
     mean_explanation_confidence: float,
 ) -> tuple[float, float]:
-    """Scale the naive conformal threshold using the configured confidence/variance rule."""
+    """Invert confidence-times-variance normalized conformal calibration."""
 
     mu = _point_prediction_for_method(output, "ours")
-    base_threshold = float(global_thresholds[float(coverage)])
-    variance = max(_prediction_variance_proxy(output), 1e-6)
-    normalized_confidence = max(float(explanation_confidence), 1e-6) / max(
-        float(mean_explanation_confidence),
-        1e-6,
+    q_hat = float(global_thresholds[float(coverage)])
+    normalizer = _confidence_variance_normalizer(
+        output=output,
+        explanation_confidence=explanation_confidence,
     )
-    variance_sqrt = math.sqrt(variance)
-    rule = os.environ.get("OURS_INTERVAL_RULE", "confidence_only").strip().lower()
-    variance_floor = max(float(os.environ.get("OURS_VARIANCE_FLOOR", "0.0025")), 1e-6)
-    max_scale = max(float(os.environ.get("OURS_SCALE_MAX", "10.0")), 1e-6)
-
-    if rule == "divide_variance":
-        scale = normalized_confidence / variance
-    elif rule == "divide_sqrt_variance":
-        scale = normalized_confidence / max(variance_sqrt, 1e-6)
-    elif rule == "multiply_variance":
-        scale = normalized_confidence * variance
-    elif rule == "multiply_sqrt_variance":
-        scale = normalized_confidence * variance_sqrt
-    elif rule == "confidence_only":
-        scale = normalized_confidence
-    elif rule == "clamped_divide_variance":
-        scale = normalized_confidence / max(variance, variance_floor)
-        scale = min(scale, max_scale)
-    else:
-        raise ValueError(
-            "OURS_INTERVAL_RULE must be one of: divide_variance, divide_sqrt_variance, "
-            "multiply_variance, multiply_sqrt_variance, confidence_only, clamped_divide_variance."
-        )
-
-    adjusted_threshold = base_threshold * scale
+    del mean_explanation_confidence
+    adjusted_threshold = q_hat * normalizer
     return mu - adjusted_threshold, mu + adjusted_threshold
+
+
+def _confidence_adjusted_abs_error(abs_error: float, explanation_confidence: float) -> float:
+    """Penalize large errors more when the model reports high confidence."""
+
+    confidence = min(max(float(explanation_confidence), 0.0), 1.0)
+    return float(abs_error * (0.5 + confidence))
+
+
+def _variance_weighted_explanation_error(
+    abs_error: float,
+    explanation_confidence: float,
+    predicted_variance: float,
+) -> float:
+    """Combine error, confidence, and predicted variance for diagnostics."""
+
+    adjusted_error = _confidence_adjusted_abs_error(abs_error, explanation_confidence)
+    return float(adjusted_error / math.sqrt(max(float(predicted_variance), 1e-6)))
 
 
 def _regime_components(regime: str) -> tuple[str, str]:
@@ -888,7 +963,8 @@ def _metric_row(
     interval_widths: dict[float, list[float]] = {coverage: [] for coverage in coverages}
 
     mu_values = [_point_prediction_for_method(output, method) for output in outputs]
-    mae = float(np.mean([abs(mu - y) for mu, y in zip(mu_values, labels)]))
+    abs_errors = [abs(mu - y) for mu, y in zip(mu_values, labels)]
+    mae = float(np.mean(abs_errors))
     rmse = float(np.sqrt(np.mean([(mu - y) ** 2 for mu, y in zip(mu_values, labels)])))
     if method == "same_ticker_baseline":
         dir_acc = float(
@@ -918,6 +994,24 @@ def _metric_row(
         if reference_explanation_confidence is not None
         else _mean_explanation_confidence(metadata)
     )
+    explanation_confidences = [
+        float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
+        for output, event_metadata in zip(outputs, metadata)
+    ]
+    predicted_variances = [_prediction_variance_proxy(output) for output in outputs]
+    variance_weighted_errors = [
+        _variance_weighted_explanation_error(abs_error, confidence, variance)
+        for abs_error, confidence, variance in zip(
+            abs_errors,
+            explanation_confidences,
+            predicted_variances,
+        )
+    ]
 
     for output, label, regime, event_metadata in zip(outputs, labels, regimes, metadata):
         explanation_confidence = float(
@@ -976,6 +1070,9 @@ def _metric_row(
         "MAE": mae,
         "RMSE": rmse,
         "dir_acc": dir_acc,
+        "avg_explanation_confidence": float(np.mean(explanation_confidences)),
+        "avg_predicted_variance_proxy": float(np.mean(predicted_variances)),
+        "avg_variance_weighted_explanation_error": float(np.mean(variance_weighted_errors)),
     }
 
 
@@ -1065,12 +1162,20 @@ def _prediction_rows(
         interval_bounds: dict[float, tuple[float, float]] = {}
         for coverage in (0.80, 0.90, 0.95):
             if mode == "adaptive":
-                lower, upper = predictor.predict_interval(
-                    output=output,
-                    regime=regime,
-                    coverage=coverage,
-                    metadata=event_metadata,
-                )
+                try:
+                    lower, upper = predictor.predict_interval(
+                        output=output,
+                        regime=regime,
+                        coverage=coverage,
+                        metadata=event_metadata,
+                    )
+                except KeyError:
+                    threshold = _fallback_threshold(predictor, coverage)
+                    base_lower, base_upper = _output_interval_bounds_for_coverage(
+                        output,
+                        coverage,
+                    )
+                    lower, upper = base_lower - threshold, base_upper + threshold
             elif mode == "naive":
                 lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
             elif mode == "confidence_scaled_naive":
@@ -1103,11 +1208,26 @@ def _prediction_rows(
         transcript_preview = transcript_text[:240].replace("\n", " ").strip()
         feature_values = _feature_triplet(event)
         mu = _point_prediction_for_method(output, method)
+        abs_error = abs(mu - float(label))
         explanation_confidence = float(
             event_metadata.get(
                 "explanation_confidence",
                 output.get("introspective_score", 0.0),
             )
+        )
+        predicted_variance_proxy = _prediction_variance_proxy(output)
+        explanation_adjusted_abs_error = _confidence_adjusted_abs_error(
+            abs_error,
+            explanation_confidence,
+        )
+        variance_weighted_explanation_error = _variance_weighted_explanation_error(
+            abs_error,
+            explanation_confidence,
+            predicted_variance_proxy,
+        )
+        confidence_variance_normalizer = _confidence_variance_normalizer(
+            output=output,
+            explanation_confidence=explanation_confidence,
         )
         financial_metadata = financial_lookup.get(
             (str(ticker).upper(), str(event.get("date", ""))),
@@ -1124,7 +1244,15 @@ def _prediction_rows(
                 "expected_return": mu,
                 "predicted_return": mu,
                 "actual_minus_expected": float(label) - mu,
+                "abs_error": abs_error,
                 "prediction_error": mu - float(label),
+                "predicted_variance_proxy": predicted_variance_proxy,
+                "variance_confidence": float(
+                    output.get(
+                        "variance_confidence",
+                        output.get("interval_confidence", 0.0),
+                    )
+                ),
                 "predicted_q_low": float(output.get("q_low", mu)),
                 "predicted_q_high": float(output.get("q_high", mu)),
                 "base_interval_width": float(
@@ -1164,7 +1292,16 @@ def _prediction_rows(
                 "implied_vol": float(feature_values[2]),
                 "avg_sentiment": float(sentiment_values[0]),
                 "message_volume": float(sentiment_values[1]),
+                "llm_confidence": float(
+                    event_metadata.get(
+                        "llm_confidence",
+                        output.get("introspective_score", explanation_confidence),
+                    )
+                ),
                 "explanation_confidence": explanation_confidence,
+                "confidence_variance_normalizer": confidence_variance_normalizer,
+                "explanation_adjusted_abs_error": explanation_adjusted_abs_error,
+                "variance_weighted_explanation_error": variance_weighted_explanation_error,
                 "modality_disagreement": float(
                     event_metadata.get("modality_disagreement", 0.0)
                 ),
@@ -1279,7 +1416,7 @@ def _selective_metric_rows(
     return rows
 
 
-def evaluate(config_path: str) -> None:
+def evaluate(config_path: str, allow_synthetic_fallback: bool = False) -> None:
     """Evaluate the trained model, ablations, and conformal baselines.
 
     Args:
@@ -1290,8 +1427,17 @@ def evaluate(config_path: str) -> None:
     config = _load_config(config_file)
     data_config = config.get("data", {})
     split_config = data_config.get("split", {})
-    feature_stats = _load_feature_stats()
-    all_events = _load_cached_events()
+    use_synthetic_fallback = bool(
+        allow_synthetic_fallback
+        or data_config.get("split", {}).get("allow_synthetic_fallback", False)
+    )
+    try:
+        all_events = _load_cached_events()
+    except FileNotFoundError:
+        if not use_synthetic_fallback:
+            raise
+        print("data/events_cache.pt not found; using synthetic fallback events.")
+        all_events = _build_synthetic_fallback_events()
     all_events = filter_events_by_universe(all_events, data_config.get("universe"))
     if not all_events:
         raise ValueError(
@@ -1307,6 +1453,12 @@ def evaluate(config_path: str) -> None:
     except Exception as exc:
         raise ValueError(f"Could not build the requested evaluation split. {exc}") from exc
     _assert_disjoint_splits(train_events, val_events, cal_events, test_events)
+    try:
+        feature_stats = _load_feature_stats()
+    except FileNotFoundError:
+        if not use_synthetic_fallback:
+            raise
+        feature_stats = EarningsDataset.compute_feature_stats(train_events)
     regime_thresholds = _load_regime_thresholds(config, train_events + val_events)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
@@ -1322,14 +1474,21 @@ def evaluate(config_path: str) -> None:
         model_path = PROJECT_ROOT / "model.pt"
 
     model = MultimodalForecastModel.load_from_config(str(config_file))
-    state_dict = torch.load(model_path, map_location="cpu")
-    load_result = model.load_state_dict(state_dict, strict=False)
-    missing_keys = list(getattr(load_result, "missing_keys", []))
-    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
-    if missing_keys or unexpected_keys:
-        print(
-            "Warning: loaded checkpoint with partial compatibility. "
-            f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}"
+    if model_path.is_file():
+        state_dict = torch.load(model_path, map_location="cpu")
+        load_result = model.load_state_dict(state_dict, strict=False)
+        missing_keys = list(getattr(load_result, "missing_keys", []))
+        unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+        if missing_keys or unexpected_keys:
+            print(
+                "Warning: loaded checkpoint with partial compatibility. "
+                f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}"
+            )
+    elif use_synthetic_fallback:
+        print("Model checkpoint not found; evaluating an untrained model for smoke-test fallback.")
+    else:
+        raise FileNotFoundError(
+            "No model checkpoint found. Run: python3 experiments/train.py first."
         )
     model.eval()
     model.to(device)
@@ -1372,7 +1531,7 @@ def evaluate(config_path: str) -> None:
     include_selective_analysis = bool(
         config.get("evaluation", {}).get("include_selective_analysis", False)
     )
-    print(f"Ours interval rule: {os.environ.get('OURS_INTERVAL_RULE', 'confidence_only')}")
+    print("Ours interval rule: llm_confidence_variance_normalized_conformal")
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1382,19 +1541,25 @@ def evaluate(config_path: str) -> None:
     )
     calibration_explanation_confidence = _mean_explanation_confidence(cal_metadata)
     global_thresholds = _build_global_thresholds(cal_outputs, cal_labels, coverage_levels)
+    confidence_variance_thresholds = _build_confidence_variance_thresholds(
+        cal_outputs=cal_outputs,
+        cal_labels=cal_labels,
+        cal_metadata=cal_metadata,
+        coverage_levels=coverage_levels,
+        reference_explanation_confidence=calibration_explanation_confidence,
+    )
     historical_events = train_events + val_events + cal_events
     event_conditioned_predictor = EventConditionedConformalPredictor(
         coverage_levels=coverage_levels,
         use_attention_conditioning=True,
         use_explanation_adjustment=False,
     )
-    if include_selective_analysis:
-        event_conditioned_predictor.calibrate(
-            cal_outputs=cal_outputs,
-            cal_labels=cal_labels,
-            cal_regimes=cal_regimes,
-            cal_metadata=cal_metadata,
-        )
+    event_conditioned_predictor.calibrate(
+        cal_outputs=cal_outputs,
+        cal_labels=cal_labels,
+        cal_regimes=cal_regimes,
+        cal_metadata=cal_metadata,
+    )
 
     results_rows: list[dict[str, float | str]] = []
     subgroup_rows: list[dict[str, float | str | int]] = []
@@ -1457,6 +1622,11 @@ def evaluate(config_path: str) -> None:
 
     for method, mode, active_predictor in evaluation_specs:
         outputs, labels, regimes, _tickers = method_payloads[method]
+        thresholds_for_call = (
+            confidence_variance_thresholds
+            if mode == "confidence_scaled_naive"
+            else global_thresholds
+        )
 
         results_rows.append(
             _metric_row(
@@ -1465,7 +1635,7 @@ def evaluate(config_path: str) -> None:
                 labels=labels,
                 regimes=regimes,
                 predictor=active_predictor,
-                global_thresholds=global_thresholds,
+                global_thresholds=thresholds_for_call,
                 mode=mode,
                 metadata=test_metadata,
                 reference_explanation_confidence=calibration_explanation_confidence,
@@ -1480,7 +1650,7 @@ def evaluate(config_path: str) -> None:
                 regimes=regimes,
                 tickers=_tickers,
                 predictor=active_predictor,
-                global_thresholds=global_thresholds,
+                global_thresholds=thresholds_for_call,
                 mode=mode,
                 metadata=test_metadata,
                 financial_lookup=financial_lookup,
@@ -1494,7 +1664,7 @@ def evaluate(config_path: str) -> None:
                     labels=labels,
                     regimes=regimes,
                     predictor=active_predictor,
-                    global_thresholds=global_thresholds,
+                    global_thresholds=thresholds_for_call,
                     mode=mode,
                     min_scores=[
                         float(score)
@@ -1514,7 +1684,7 @@ def evaluate(config_path: str) -> None:
                 labels=labels,
                 regimes=regimes,
                 predictor=active_predictor,
-                global_thresholds=global_thresholds,
+                global_thresholds=thresholds_for_call,
                 mode=mode,
                 metadata=test_metadata,
                 reference_explanation_confidence=calibration_explanation_confidence,
@@ -1650,4 +1820,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    evaluate(args.config)
+    evaluate(args.config, allow_synthetic_fallback=args.allow_synthetic_fallback)
