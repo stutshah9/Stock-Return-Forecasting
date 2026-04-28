@@ -1,4 +1,4 @@
-"""vLLM-backed forecast explainer that emits a calibrated confidence score."""
+"""vLLM-backed forecast explainer that emits a numeric confidence and |return| estimate."""
 
 from __future__ import annotations
 
@@ -10,20 +10,24 @@ from pathlib import Path
 from typing import Any
 
 
-_CONFIDENCE_LABELS = ("HIGH", "MEDIUM", "LOW")
-_LABEL_SCORE = {"HIGH": 1.0, "MEDIUM": 0.5, "LOW": 0.0}
-_CONFIDENCE_REGEX = re.compile(r"Confidence:\s*(HIGH|MEDIUM|LOW)", re.IGNORECASE)
+_PROMPT_VERSION = "v2-numeric"
+_CONFIDENCE_REGEX = re.compile(r"confidence[^:\n]*:\s*([0-9]{1,3})", re.IGNORECASE)
+_ABS_RETURN_REGEX = re.compile(
+    r"(?:absolute|expected|predicted)?\s*return[^:\n]*:\s*([+-]?[0-9]*\.?[0-9]+)",
+    re.IGNORECASE,
+)
+_DIGIT_TOKENS = {str(d) for d in range(10)}
 
 
 class LLMExplainer:
-    """Generate per-event forecast explanations and confidence via vLLM."""
+    """Generate forecast explanations, numeric confidence, and predicted |return|."""
 
     def __init__(
         self,
         model_name: str = "mistralai/Mistral-7B-Instruct-v0.3",
         cache_path: str | Path | None = None,
-        max_new_tokens: int = 96,
-        top_logprobs: int = 5,
+        max_new_tokens: int = 128,
+        top_logprobs: int = 10,
         gpu_memory_utilization: float = 0.85,
         quantization: str | None = "awq",
         tensor_parallel_size: int = 1,
@@ -68,15 +72,18 @@ class LLMExplainer:
         ticker = str(item.get("ticker", "")).upper() or "UNKNOWN"
         instruction = (
             "You are a financial analyst. Given an earnings call excerpt and a "
-            "quantitative forecast for the next-day stock return, write one sentence "
-            "explaining the forecast, then on a new line state your confidence as "
-            "exactly one of HIGH, MEDIUM, or LOW.\n\n"
+            "quantitative point forecast for the next-day stock return, answer "
+            "three things: (1) explain the forecast in one sentence, (2) rate "
+            "your confidence in the forecast on an integer scale from 0 to 100, "
+            "and (3) predict the absolute (unsigned) magnitude of the next-day "
+            "return as a percent of the current price.\n\n"
             f"Ticker: {ticker}\n"
             f"Earnings call excerpt:\n{excerpt}\n\n"
-            f"Forecast: mu={mu:+.4f}, 90% interval=[{q_low:+.4f}, {q_high:+.4f}].\n\n"
-            "Respond exactly in this format and nothing else:\n"
+            f"Quantitative forecast: mu={mu:+.4f}, 90% interval=[{q_low:+.4f}, {q_high:+.4f}].\n\n"
+            "Respond in EXACTLY this format and nothing else:\n"
             "Explanation: <one sentence>\n"
-            "Confidence: <HIGH|MEDIUM|LOW>"
+            "Confidence (0-100): <integer>\n"
+            "Expected absolute return (percent): <number>"
         )
         try:
             return self.tokenizer.apply_chat_template(
@@ -92,6 +99,7 @@ class LLMExplainer:
         transcript = str(item.get("transcript") or "")
         material = "|".join(
             [
+                _PROMPT_VERSION,
                 str(item.get("ticker", "")).upper(),
                 str(item.get("date", "")),
                 str(item.get("method", "")),
@@ -103,48 +111,102 @@ class LLMExplainer:
         )
         return hashlib.sha1(material.encode("utf-8")).hexdigest()
 
-    def _decode_token(self, token_id: int, logprob_obj: Any) -> str:
-        decoded = getattr(logprob_obj, "decoded_token", None)
-        if decoded is None:
-            decoded = self.tokenizer.decode([int(token_id)])
-        return str(decoded).strip().upper()
+    def _decode_token(self, token_id: int) -> str:
+        return str(self.tokenizer.decode([int(token_id)]))
 
-    def _extract_confidence(self, generated_output: Any) -> tuple[str, float]:
-        text = str(generated_output.text)
-        match = _CONFIDENCE_REGEX.search(text)
-        if match is None:
-            return text, 0.5
-        hard_label = match.group(1).upper()
-        hard_score = _LABEL_SCORE[hard_label]
+    def _soft_confidence_from_logprobs(self, generated_output: Any) -> float | None:
+        """Compute soft confidence by reading digit logprobs of the Confidence number.
 
-        token_logprobs = getattr(generated_output, "logprobs", None)
+        Walks output tokens, finds where the model emitted "Confidence" and the
+        digits that followed, and returns sum_d (digit_value * P(digit)) over
+        the top-k logprob alternatives at each digit position. Returns None if
+        the structure can't be matched (caller falls back to greedy parse).
+        """
+
         token_ids = getattr(generated_output, "token_ids", None)
-        if token_logprobs is None or token_ids is None:
-            return text, hard_score
+        token_logprobs = getattr(generated_output, "logprobs", None)
+        if token_ids is None or token_logprobs is None:
+            return None
 
+        text_so_far = ""
+        past_label = False
+        per_digit_softs: list[float] = []
         for token_id, lp_dict in zip(token_ids, token_logprobs):
-            if lp_dict is None:
-                continue
-            chosen = self._decode_token(token_id, lp_dict.get(int(token_id)) if hasattr(lp_dict, "get") else None)
-            if chosen not in _CONFIDENCE_LABELS:
+            decoded = self._decode_token(int(token_id))
+            text_so_far += decoded
+
+            if not past_label:
+                if "confidence" in text_so_far.lower():
+                    if ":" in text_so_far:
+                        text_so_far = text_so_far.split(":", 1)[1]
+                        past_label = True
                 continue
 
-            weights: dict[str, float] = {}
+            stripped = decoded.strip()
+            if stripped == "" or not any(ch.isdigit() for ch in stripped):
+                if per_digit_softs:
+                    break
+                continue
+
+            if not (stripped.isdigit() and len(stripped) == 1) or lp_dict is None:
+                continue
+
+            digit_weights: dict[int, float] = {}
             for alt_id, alt_lp in lp_dict.items():
-                alt_decoded = self._decode_token(int(alt_id), alt_lp)
-                if alt_decoded in _CONFIDENCE_LABELS:
-                    weights[alt_decoded] = math.exp(float(alt_lp.logprob))
+                alt_decoded = self._decode_token(int(alt_id)).strip()
+                if len(alt_decoded) == 1 and alt_decoded.isdigit():
+                    digit_weights[int(alt_decoded)] = math.exp(float(alt_lp.logprob))
+            if not digit_weights:
+                per_digit_softs.append(float(int(stripped)))
+            else:
+                total = sum(digit_weights.values())
+                per_digit_softs.append(
+                    sum(digit * (weight / total) for digit, weight in digit_weights.items())
+                )
+            if len(per_digit_softs) >= 3:
+                break
 
-            if not weights:
-                return text, hard_score
+        if not per_digit_softs:
+            return None
+        digits = per_digit_softs
+        soft_value = 0.0
+        place = 10 ** (len(digits) - 1)
+        for digit_soft in digits:
+            soft_value += digit_soft * place
+            place //= 10
+        return float(min(max(soft_value / 100.0, 0.0), 1.0))
 
-            total = sum(weights.values())
-            soft = sum(
-                weights.get(label, 0.0) * _LABEL_SCORE[label] for label in _CONFIDENCE_LABELS
-            ) / max(total, 1e-9)
-            return text, float(min(max(soft, 0.0), 1.0))
+    def _parse_response(self, generated_output: Any) -> dict[str, Any]:
+        """Parse explanation, confidence (0-1), predicted abs return (decimal)."""
 
-        return text, hard_score
+        text = str(generated_output.text)
+        confidence_match = _CONFIDENCE_REGEX.search(text)
+        if confidence_match is not None:
+            greedy_confidence = float(confidence_match.group(1)) / 100.0
+            greedy_confidence = min(max(greedy_confidence, 0.0), 1.0)
+        else:
+            greedy_confidence = 0.5
+
+        soft = self._soft_confidence_from_logprobs(generated_output)
+        confidence = soft if soft is not None else greedy_confidence
+
+        return_match = _ABS_RETURN_REGEX.search(text)
+        if return_match is not None:
+            try:
+                pct_value = float(return_match.group(1))
+            except ValueError:
+                pct_value = 2.0
+            abs_return = pct_value / 100.0
+        else:
+            abs_return = 0.02
+        abs_return = min(max(abs_return, 1e-3), 1.0)
+
+        return {
+            "explanation": text,
+            "confidence": float(confidence),
+            "greedy_confidence": float(greedy_confidence),
+            "abs_return": float(abs_return),
+        }
 
     def _save_cache(self) -> None:
         if self.cache_path is None:
@@ -155,16 +217,25 @@ class LLMExplainer:
             json.dump(self.cache, fh)
         tmp_path.replace(self.cache_path)
 
-    def explain_batch(self, items: list[dict[str, Any]]) -> list[tuple[str, float]]:
-        results: list[tuple[str, float] | None] = [None] * len(items)
+    def explain_batch(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any] | None] = [None] * len(items)
         prompts_to_generate: list[str] = []
         pending: list[tuple[int, str]] = []
 
         for index, item in enumerate(items):
             key = self._cache_key(item)
             cached = self.cache.get(key)
-            if cached is not None and "explanation" in cached and "confidence" in cached:
-                results[index] = (str(cached["explanation"]), float(cached["confidence"]))
+            if (
+                cached is not None
+                and "explanation" in cached
+                and "confidence" in cached
+                and "abs_return" in cached
+            ):
+                results[index] = {
+                    "explanation": str(cached["explanation"]),
+                    "confidence": float(cached["confidence"]),
+                    "abs_return": float(cached["abs_return"]),
+                }
                 continue
             prompts_to_generate.append(self._build_prompt(item))
             pending.append((index, key))
@@ -173,12 +244,18 @@ class LLMExplainer:
             generations = self.llm.generate(prompts_to_generate, sampling_params=self.params)
             for (result_index, cache_key), generation in zip(pending, generations):
                 gen = generation.outputs[0]
-                explanation, confidence = self._extract_confidence(gen)
-                results[result_index] = (explanation, confidence)
+                parsed = self._parse_response(gen)
+                results[result_index] = {
+                    "explanation": parsed["explanation"],
+                    "confidence": parsed["confidence"],
+                    "abs_return": parsed["abs_return"],
+                }
                 self.cache[cache_key] = {
-                    "explanation": explanation,
-                    "confidence": float(confidence),
+                    "explanation": parsed["explanation"],
+                    "confidence": float(parsed["confidence"]),
+                    "abs_return": float(parsed["abs_return"]),
+                    "greedy_confidence": float(parsed.get("greedy_confidence", parsed["confidence"])),
                 }
             self._save_cache()
 
-        return [item if item is not None else ("", 0.5) for item in results]
+        return [item if item is not None else {"explanation": "", "confidence": 0.5, "abs_return": 0.02} for item in results]

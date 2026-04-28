@@ -465,11 +465,23 @@ rsync -avh --progress \
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
-srun --account=cp-spring2026-iac      --partition=a30_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:a30:1      --pty bash -l
-source .venv/bin/activate
-cd earnings_forecast/
+srun --account=cp-spring2026-iac \
+     --partition=l40s_normal_q \
+     --qos=fal_l40s_normal_short \
+     --cpus-per-task=1 \
+     --mem=32G \
+     --time=02:00:00 \
+     --gres=gpu:l40s:1 \
+     --pty bash -l
+source stock_forecasting_py311_venv/bin/activate
+cd earnings_forecast
 python3 experiments/train.py
-python3 experiments/evaluate.py
+python experiments/evaluate.py \
+  --use-llm \
+  --llm-model mistralai/Mistral-7B-Instruct-v0.3 \
+  --llm-cache data/llm_cache.json \
+  --llm-quantization none \
+  --llm-gpu-memory 0.85
 
 # pull data from ARC
 rsync -avh --progress \

@@ -470,7 +470,104 @@ def _point_prediction_for_method(
 
     if method == "naive_conformal":
         return _to_float(output.get("quantile_median", output["mu"]))
+    if method == "ours" and "ensemble_mu" in output:
+        return _to_float(output["ensemble_mu"])
     return _to_float(output.get("point_mu", output["mu"]))
+
+
+_ENSEMBLE_MODALITIES: tuple[str, ...] = (
+    "full_multimodal",
+    "text_only",
+    "financial_only",
+    "sentiment_only",
+)
+
+
+def _fit_modal_ensemble_weights(
+    cal_full_outputs: list[dict[str, Any]],
+    cal_text_outputs: list[dict[str, Any]],
+    cal_financial_outputs: list[dict[str, Any]],
+    cal_sentiment_outputs: list[dict[str, Any]],
+    cal_labels: list[float],
+) -> dict[str, float]:
+    """Fit non-negative simplex ensemble weights minimizing |y - sum w_m * mu_m|^2."""
+
+    from scipy.optimize import minimize
+
+    if not (
+        len(cal_full_outputs)
+        == len(cal_text_outputs)
+        == len(cal_financial_outputs)
+        == len(cal_sentiment_outputs)
+        == len(cal_labels)
+    ):
+        raise ValueError("Modal ensemble inputs must have matching lengths.")
+
+    mu_full = np.asarray(
+        [_point_prediction_for_method(o, "full_multimodal") for o in cal_full_outputs],
+        dtype=float,
+    )
+    mu_text = np.asarray(
+        [_point_prediction_for_method(o, "text_only") for o in cal_text_outputs],
+        dtype=float,
+    )
+    mu_financial = np.asarray(
+        [_point_prediction_for_method(o, "financial_only") for o in cal_financial_outputs],
+        dtype=float,
+    )
+    mu_sentiment = np.asarray(
+        [_point_prediction_for_method(o, "sentiment_only") for o in cal_sentiment_outputs],
+        dtype=float,
+    )
+    design = np.stack([mu_full, mu_text, mu_financial, mu_sentiment], axis=1)
+    targets = np.asarray(cal_labels, dtype=float)
+
+    def loss(weights: np.ndarray) -> float:
+        return float(np.mean((design @ weights - targets) ** 2))
+
+    constraints = ({"type": "eq", "fun": lambda weights: float(np.sum(weights) - 1.0)},)
+    bounds = [(0.0, 1.0)] * design.shape[1]
+    initial = np.full(design.shape[1], 1.0 / design.shape[1])
+
+    result = minimize(
+        loss,
+        initial,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"ftol": 1e-9, "maxiter": 200, "disp": False},
+    )
+    weights = np.clip(np.asarray(result.x, dtype=float), 0.0, 1.0)
+    weight_sum = float(weights.sum())
+    if weight_sum < 1e-9:
+        weights = np.array([1.0, 0.0, 0.0, 0.0])
+    else:
+        weights = weights / weight_sum
+    return {name: float(value) for name, value in zip(_ENSEMBLE_MODALITIES, weights)}
+
+
+def _apply_ensemble_weights(
+    full_outputs: list[dict[str, Any]],
+    text_outputs: list[dict[str, Any]],
+    financial_outputs: list[dict[str, Any]],
+    sentiment_outputs: list[dict[str, Any]],
+    weights: dict[str, float],
+) -> None:
+    """Inject ``ensemble_mu`` into each full_multimodal output dict in place."""
+
+    w_full = float(weights.get("full_multimodal", 0.0))
+    w_text = float(weights.get("text_only", 0.0))
+    w_financial = float(weights.get("financial_only", 0.0))
+    w_sentiment = float(weights.get("sentiment_only", 0.0))
+    for full, text, financial, sentiment in zip(
+        full_outputs, text_outputs, financial_outputs, sentiment_outputs
+    ):
+        full["ensemble_mu"] = float(
+            w_full * _point_prediction_for_method(full, "full_multimodal")
+            + w_text * _point_prediction_for_method(text, "text_only")
+            + w_financial * _point_prediction_for_method(financial, "financial_only")
+            + w_sentiment * _point_prediction_for_method(sentiment, "sentiment_only")
+        )
 
 
 def _prediction_variance_proxy(output: dict[str, Any]) -> float:
@@ -555,6 +652,9 @@ def _confidence_variance_normalizer(
     and test-time intervals are comparably sized to naive conformal.
     """
 
+    llm_abs_return = float(output.get("llm_predicted_abs_return", 0.0))
+    if llm_abs_return > 1e-6:
+        return float(max(llm_abs_return, 1e-9))
     confidence = min(max(float(explanation_confidence), 0.05), 0.95)
     variance = max(_prediction_variance_proxy(output), 1e-6)
     std = math.sqrt(variance)
@@ -793,11 +893,62 @@ def _compute_model_outputs(
             for index, output in enumerate(outputs)
         ]
         llm_results = llm_explainer.explain_batch(llm_items)
-        for output, (llm_text, llm_confidence) in zip(outputs, llm_results):
-            output["explanation"] = str(llm_text)
-            output["llm_confidence"] = float(llm_confidence)
+        for output, parsed in zip(outputs, llm_results):
+            output["explanation"] = str(parsed.get("explanation", ""))
+            output["llm_confidence"] = float(parsed.get("confidence", 0.5))
+            output["llm_predicted_abs_return"] = float(parsed.get("abs_return", 0.02))
 
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
+
+
+def _compute_ticker_volatilities(
+    historical_events: list[dict[str, Any]],
+    min_events: int = 2,
+) -> tuple[dict[str, float], float]:
+    """Compute per-ticker historical return std from past events.
+
+    Returns (per_ticker_vol, default_vol) where ``default_vol`` is the median
+    used when a ticker has too few historical events to estimate.
+    """
+
+    by_ticker: dict[str, list[float]] = {}
+    for event in historical_events:
+        ticker = str(event.get("ticker", "")).upper()
+        label = event.get("label")
+        if not ticker or label is None:
+            continue
+        try:
+            value = float(label)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        by_ticker.setdefault(ticker, []).append(value)
+
+    per_ticker: dict[str, float] = {}
+    for ticker, values in by_ticker.items():
+        if len(values) >= int(min_events):
+            sigma = float(np.std(values, ddof=1))
+            if math.isfinite(sigma) and sigma > 0.0:
+                per_ticker[ticker] = sigma
+    default_vol = (
+        float(np.median(list(per_ticker.values()))) if per_ticker else 0.02
+    )
+    return per_ticker, default_vol
+
+
+def _attach_ticker_volatilities(
+    outputs: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    per_ticker_vol: dict[str, float],
+    default_vol: float,
+) -> None:
+    """Inject ``ticker_historical_vol`` into each output dict in place."""
+
+    for output, event in zip(outputs, events):
+        ticker = str(event.get("ticker", "")).upper()
+        sigma = per_ticker_vol.get(ticker, float(default_vol))
+        output["ticker_historical_vol"] = float(max(sigma, 1e-6))
 
 
 def _same_ticker_baseline_parameters(
@@ -1328,6 +1479,12 @@ def _prediction_rows(
                         output.get("introspective_score", explanation_confidence),
                     )
                 ),
+                "llm_predicted_abs_return": float(
+                    output.get("llm_predicted_abs_return", 0.0)
+                ),
+                "ticker_historical_vol": float(
+                    output.get("ticker_historical_vol", 0.0)
+                ),
                 "explanation_confidence": explanation_confidence,
                 "confidence_variance_normalizer": confidence_variance_normalizer,
                 "explanation_adjusted_abs_error": explanation_adjusted_abs_error,
@@ -1590,7 +1747,17 @@ def evaluate(
     include_selective_analysis = bool(
         config.get("evaluation", {}).get("include_selective_analysis", False)
     )
-    print("Ours interval rule: llm_confidence_variance_normalized_conformal")
+
+    per_ticker_vol, default_ticker_vol = _compute_ticker_volatilities(
+        train_events + val_events + cal_events
+    )
+    print(
+        f"Ticker historical-vol coverage: {len(per_ticker_vol)} tickers, "
+        f"default={default_ticker_vol:.4f}"
+    )
+    _attach_ticker_volatilities(cal_outputs, cal_events, per_ticker_vol, default_ticker_vol)
+
+    print("Ours interval rule: ticker_historical_vol_normalized_conformal")
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1599,6 +1766,24 @@ def evaluate(
         sentiment_outputs=cal_sentiment_outputs,
     )
     calibration_explanation_confidence = _mean_explanation_confidence(cal_metadata)
+    ensemble_weights = _fit_modal_ensemble_weights(
+        cal_full_outputs=cal_outputs,
+        cal_text_outputs=cal_text_outputs,
+        cal_financial_outputs=cal_financial_outputs,
+        cal_sentiment_outputs=cal_sentiment_outputs,
+        cal_labels=cal_labels,
+    )
+    print(
+        "Modal ensemble weights: "
+        + ", ".join(f"{name}={ensemble_weights[name]:.3f}" for name in _ENSEMBLE_MODALITIES)
+    )
+    _apply_ensemble_weights(
+        full_outputs=cal_outputs,
+        text_outputs=cal_text_outputs,
+        financial_outputs=cal_financial_outputs,
+        sentiment_outputs=cal_sentiment_outputs,
+        weights=ensemble_weights,
+    )
     global_thresholds = _build_global_thresholds(cal_outputs, cal_labels, coverage_levels)
     confidence_variance_thresholds = _build_confidence_variance_thresholds(
         cal_outputs=cal_outputs,
@@ -1661,6 +1846,16 @@ def evaluate(
             test_sentiment_outputs = outputs
             continue
 
+    _apply_ensemble_weights(
+        full_outputs=test_full_outputs,
+        text_outputs=test_text_outputs,
+        financial_outputs=test_financial_outputs,
+        sentiment_outputs=test_sentiment_outputs,
+        weights=ensemble_weights,
+    )
+    _attach_ticker_volatilities(
+        test_full_outputs, test_events, per_ticker_vol, default_ticker_vol
+    )
     test_metadata, _unused_center, _unused_scale = _build_explanation_metadata(
         events=test_events,
         full_outputs=test_full_outputs,
