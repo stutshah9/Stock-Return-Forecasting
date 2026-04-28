@@ -434,16 +434,20 @@ def _build_explanation_metadata(
             scale=scale,
         )
         model_confidence = float(full_output.get("introspective_score", 0.5))
+        if "llm_confidence" in full_output:
+            llm_confidence = min(max(float(full_output["llm_confidence"]), 0.0), 1.0)
+        else:
+            llm_confidence = _confidence_from_explanation_string(
+                str(full_output.get("explanation", ""))
+            )
         metadata_rows.append(
             {
                 **base_metadata,
                 "modality_disagreement": float(disagreement),
                 "disagreement_confidence": float(disagreement_confidence),
                 "model_confidence": model_confidence,
-                "llm_confidence": model_confidence,
-                "explanation_confidence": float(
-                    min(max(0.7 * model_confidence + 0.3 * disagreement_confidence, 0.0), 1.0)
-                ),
+                "llm_confidence": float(llm_confidence),
+                "explanation_confidence": float(llm_confidence),
             }
         )
     return metadata_rows, center, scale
@@ -544,11 +548,17 @@ def _confidence_variance_normalizer(
     output: dict[str, Any],
     explanation_confidence: float,
 ) -> float:
-    """Return the confidence-times-variance scale used by normalized conformal."""
+    """Return string_conf * std as the normalized conformal scale.
+
+    Using std (interval half-width) rather than variance keeps calibration
+    scores in a ~1-3x range instead of ~10-100x, so q_hat stays reasonable
+    and test-time intervals are comparably sized to naive conformal.
+    """
 
     confidence = min(max(float(explanation_confidence), 0.05), 0.95)
     variance = max(_prediction_variance_proxy(output), 1e-6)
-    return float(max(confidence * variance, 1e-9))
+    std = math.sqrt(variance)
+    return float(max(confidence * std, 1e-9))
 
 
 def _build_confidence_variance_thresholds(
@@ -673,6 +683,7 @@ def _compute_model_outputs(
     method: str,
     device: torch.device,
     regime_thresholds: dict[str, float],
+    llm_explainer: Any | None = None,
 ) -> tuple[list[dict[str, float]], list[float], list[str], list[str]]:
     """Run a model-based evaluation variant and serialize its outputs."""
 
@@ -767,6 +778,25 @@ def _compute_model_outputs(
                 "explanation": str(explanations[index]),
             }
         )
+
+    if llm_explainer is not None:
+        llm_items = [
+            {
+                "ticker": str(events[index].get("ticker", "")),
+                "date": str(events[index].get("date", "")),
+                "method": method,
+                "transcript": transcripts[index] if index < len(transcripts) else "",
+                "mu": output["mu"],
+                "q_low": output["q_low"],
+                "q_high": output["q_high"],
+            }
+            for index, output in enumerate(outputs)
+        ]
+        llm_results = llm_explainer.explain_batch(llm_items)
+        for output, (llm_text, llm_confidence) in zip(outputs, llm_results):
+            output["explanation"] = str(llm_text)
+            output["llm_confidence"] = float(llm_confidence)
+
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
 
 
@@ -1416,11 +1446,39 @@ def _selective_metric_rows(
     return rows
 
 
-def evaluate(config_path: str, allow_synthetic_fallback: bool = False) -> None:
+def _maybe_load_llm_explainer(
+    use_llm: bool,
+    model_name: str,
+    cache_path: str | Path,
+    quantization: str | None,
+    gpu_memory_utilization: float,
+) -> Any | None:
+    """Lazy-load the vLLM explainer when ``--use-llm`` is set."""
+
+    if not use_llm:
+        return None
+    from encoders.llm_explainer import LLMExplainer
+
+    print(f"Loading LLM explainer: {model_name} (cache={cache_path})")
+    return LLMExplainer(
+        model_name=model_name,
+        cache_path=cache_path,
+        quantization=quantization,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
+
+
+def evaluate(
+    config_path: str,
+    allow_synthetic_fallback: bool = False,
+    llm_explainer: Any | None = None,
+) -> None:
     """Evaluate the trained model, ablations, and conformal baselines.
 
     Args:
         config_path: Path to the YAML configuration file.
+        allow_synthetic_fallback: Reserved compatibility flag.
+        llm_explainer: Optional ``LLMExplainer`` for narrative explanations + confidence.
     """
 
     config_file = _resolve_path(config_path)
@@ -1501,6 +1559,7 @@ def evaluate(config_path: str, allow_synthetic_fallback: bool = False) -> None:
         method="full_multimodal",
         device=device,
         regime_thresholds=regime_thresholds,
+        llm_explainer=llm_explainer,
     )
     cal_text_outputs, _cal_text_labels, _cal_text_regimes, _ = _compute_model_outputs(
         model=model,
@@ -1584,6 +1643,7 @@ def evaluate(config_path: str, allow_synthetic_fallback: bool = False) -> None:
             method=base_method,
             device=device,
             regime_thresholds=regime_thresholds,
+            llm_explainer=llm_explainer if base_method == "full_multimodal" else None,
         )
         if base_method == "full_multimodal":
             test_full_outputs = outputs
@@ -1818,6 +1878,46 @@ if __name__ == "__main__":
         action="store_true",
         help="Compatibility flag accepted by legacy tests; evaluation remains cache-based.",
     )
+    parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Use a vLLM-backed explainer to generate explanations and confidence scores.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="mistralai/Mistral-7B-Instruct-v0.3",
+        help="HuggingFace model id for the vLLM explainer.",
+    )
+    parser.add_argument(
+        "--llm-cache",
+        default=str(PROJECT_ROOT / "data" / "llm_cache.json"),
+        help="JSON cache path for LLM explanations and confidences.",
+    )
+    parser.add_argument(
+        "--llm-quantization",
+        default="awq",
+        help="vLLM quantization scheme (e.g. 'awq', 'gptq', or empty string for none).",
+    )
+    parser.add_argument(
+        "--llm-gpu-memory",
+        type=float,
+        default=0.85,
+        help="vLLM gpu_memory_utilization fraction.",
+    )
     args = parser.parse_args()
 
-    evaluate(args.config, allow_synthetic_fallback=args.allow_synthetic_fallback)
+    quantization = args.llm_quantization or None
+    if isinstance(quantization, str) and quantization.strip().lower() in {"", "none"}:
+        quantization = None
+    llm_explainer = _maybe_load_llm_explainer(
+        use_llm=args.use_llm,
+        model_name=args.llm_model,
+        cache_path=args.llm_cache,
+        quantization=quantization,
+        gpu_memory_utilization=args.llm_gpu_memory,
+    )
+    evaluate(
+        args.config,
+        allow_synthetic_fallback=args.allow_synthetic_fallback,
+        llm_explainer=llm_explainer,
+    )
