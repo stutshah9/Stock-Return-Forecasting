@@ -12,7 +12,7 @@ data:
     allow_synthetic_fallback: false
 
 model:
-  embed_dim: 64
+  embed_dim: 128
   dropout: 0.1
 
 training:
@@ -20,7 +20,8 @@ training:
   seed: 42
   lr: 5e-5
   batch_size: 32
-  epochs: 30
+  epochs: 50
+  patience: 10
   use_amp: true
   pinball_quantiles: [0.025, 0.05, 0.10, 0.50, 0.90, 0.95, 0.975]
   point_loss_weight: 1.0
@@ -28,7 +29,7 @@ training:
   direction_loss_weight: 0.05
   early_stop_metric: val_rmse
   grad_clip_norm: 1.0
-  uncertainty_alignment_weight: 0.0
+  uncertainty_alignment_weight: 0.05
   confidence_calibration_weight: 0.0
   attention_alignment_weight: 0.0
   explanation_alignment_weight: 0.0
