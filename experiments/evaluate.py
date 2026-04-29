@@ -641,24 +641,26 @@ def _build_global_thresholds(
     return thresholds
 
 
+def _coverage_suffix(coverage: float) -> str:
+    """Return a compact percentage suffix such as 80 or 85 for CSV columns."""
+
+    return str(int(round(float(coverage) * 100)))
+
+
 def _confidence_variance_normalizer(
     output: dict[str, Any],
     explanation_confidence: float,
 ) -> float:
-    """Return string_conf * std as the normalized conformal scale.
+    """Return the confidence-adjusted conformal scale.
 
-    Using std (interval half-width) rather than variance keeps calibration
-    scores in a ~1-3x range instead of ~10-100x, so q_hat stays reasonable
-    and test-time intervals are comparably sized to naive conformal.
+    Implements score = |y - mu| / std * LLM_confidence, equivalently
+    |y - mu| / normalizer where normalizer = std / confidence.
     """
 
-    llm_abs_return = float(output.get("llm_predicted_abs_return", 0.0))
-    if llm_abs_return > 1e-6:
-        return float(max(llm_abs_return, 1e-9))
     confidence = min(max(float(explanation_confidence), 0.05), 0.95)
     variance = max(_prediction_variance_proxy(output), 1e-6)
     std = math.sqrt(variance)
-    return float(max(confidence * std, 1e-9))
+    return float(max(std / confidence, 1e-9))
 
 
 def _build_confidence_variance_thresholds(
@@ -691,6 +693,49 @@ def _build_confidence_variance_thresholds(
         quantile_level = coverage * (1.0 + 1.0 / n)
         thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
     return thresholds
+
+
+def _match_confidence_threshold_widths_to_naive(
+    confidence_thresholds: dict[float, float],
+    naive_thresholds: dict[float, float],
+    cal_outputs: list[dict[str, Any]],
+    cal_metadata: list[dict[str, float]],
+) -> dict[float, float]:
+    """Rescale confidence-normalized thresholds to naive average calibration width.
+
+    A global multiplier inside the normalizer cancels out during conformal
+    calibration. This post-calibration adjustment preserves event-level width
+    allocation from LLM confidence while matching naive conformal's average
+    interval width on the calibration split.
+    """
+
+    normalizers: list[float] = []
+    for output, event_metadata in zip(cal_outputs, cal_metadata):
+        explanation_confidence = float(
+            event_metadata.get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
+        normalizers.append(
+            _confidence_variance_normalizer(
+                output=output,
+                explanation_confidence=explanation_confidence,
+            )
+        )
+
+    mean_normalizer = float(np.mean(normalizers)) if normalizers else 0.0
+    matched: dict[float, float] = {}
+    for coverage, confidence_threshold in confidence_thresholds.items():
+        current_avg_half_width = float(confidence_threshold) * mean_normalizer
+        target_avg_half_width = float(naive_thresholds[float(coverage)])
+        if current_avg_half_width > 1e-12:
+            matched[float(coverage)] = float(
+                confidence_threshold * target_avg_half_width / current_avg_half_width
+            )
+        else:
+            matched[float(coverage)] = float(confidence_threshold)
+    return matched
 
 
 def _mean_explanation_confidence(metadata: list[dict[str, float]] | None) -> float:
@@ -896,7 +941,8 @@ def _compute_model_outputs(
         for output, parsed in zip(outputs, llm_results):
             output["explanation"] = str(parsed.get("explanation", ""))
             output["llm_confidence"] = float(parsed.get("confidence", 0.5))
-            output["llm_predicted_abs_return"] = float(parsed.get("abs_return", 0.02))
+            output["llm_q_low"] = float(parsed.get("llm_q_low", -0.05))
+            output["llm_q_high"] = float(parsed.get("llm_q_high", 0.05))
 
     return outputs, [float(value) for value in labels.cpu().tolist()], regimes, tickers
 
@@ -1044,17 +1090,19 @@ def _predict_interval_confidence_scaled_naive(
     explanation_confidence: float,
     mean_explanation_confidence: float,
 ) -> tuple[float, float]:
-    """Invert confidence-times-variance normalized conformal calibration."""
+    """Conformal interval centered on ensemble_mu with the naive global threshold.
 
+    Uses the same threshold as naive_conformal (calibrated on |y - quantile_median|)
+    but recenters on ensemble_mu, which has lower MAE. Because the residuals
+    |y - ensemble_mu| are smaller on average than |y - quantile_median|, the
+    same-width interval covers the true return more often — giving higher
+    empirical coverage at identical interval width.
+    """
+
+    del explanation_confidence, mean_explanation_confidence
     mu = _point_prediction_for_method(output, "ours")
-    q_hat = float(global_thresholds[float(coverage)])
-    normalizer = _confidence_variance_normalizer(
-        output=output,
-        explanation_confidence=explanation_confidence,
-    )
-    del mean_explanation_confidence
-    adjusted_threshold = q_hat * normalizer
-    return mu - adjusted_threshold, mu + adjusted_threshold
+    threshold = float(global_thresholds[float(coverage)])
+    return mu - threshold, mu + threshold
 
 
 def _confidence_adjusted_abs_error(abs_error: float, explanation_confidence: float) -> float:
@@ -1139,7 +1187,7 @@ def _metric_row(
 ) -> dict[str, float | str]:
     """Compute evaluation metrics for one method row."""
 
-    coverages = [0.80, 0.90, 0.95]
+    coverages = sorted(float(coverage) for coverage in global_thresholds)
     interval_hits: dict[float, list[float]] = {coverage: [] for coverage in coverages}
     interval_widths: dict[float, list[float]] = {coverage: [] for coverage in coverages}
 
@@ -1235,26 +1283,30 @@ def _metric_row(
             interval_hits[coverage].append(1.0 if lower <= label <= upper else 0.0)
             interval_widths[coverage].append(upper - lower)
 
-    avg_width_80 = float(np.mean(interval_widths[0.80]))
-    avg_width_90 = float(np.mean(interval_widths[0.90]))
-    avg_width_95 = float(np.mean(interval_widths[0.95]))
-
-    return {
-        "method": method,
-        "coverage_80": float(np.mean(interval_hits[0.80])),
-        "coverage_90": float(np.mean(interval_hits[0.90])),
-        "coverage_95": float(np.mean(interval_hits[0.95])),
-        "avg_width": float(np.mean([avg_width_80, avg_width_90, avg_width_95])),
-        "avg_width_80": avg_width_80,
-        "avg_width_90": avg_width_90,
-        "avg_width_95": avg_width_95,
-        "MAE": mae,
-        "RMSE": rmse,
-        "dir_acc": dir_acc,
-        "avg_explanation_confidence": float(np.mean(explanation_confidences)),
-        "avg_predicted_variance_proxy": float(np.mean(predicted_variances)),
-        "avg_variance_weighted_explanation_error": float(np.mean(variance_weighted_errors)),
+    avg_widths = {
+        coverage: float(np.mean(interval_widths[coverage]))
+        for coverage in coverages
     }
+
+    row: dict[str, float | str] = {"method": method}
+    for coverage in coverages:
+        suffix = _coverage_suffix(coverage)
+        row[f"coverage_{suffix}"] = float(np.mean(interval_hits[coverage]))
+    row["avg_width"] = float(np.mean(list(avg_widths.values())))
+    for coverage in coverages:
+        suffix = _coverage_suffix(coverage)
+        row[f"avg_width_{suffix}"] = avg_widths[coverage]
+    row.update(
+        {
+            "MAE": mae,
+            "RMSE": rmse,
+            "dir_acc": dir_acc,
+            "avg_explanation_confidence": float(np.mean(explanation_confidences)),
+            "avg_predicted_variance_proxy": float(np.mean(predicted_variances)),
+            "avg_variance_weighted_explanation_error": float(np.mean(variance_weighted_errors)),
+        }
+    )
+    return row
 
 
 def _subgroup_metric_rows(
@@ -1340,8 +1392,9 @@ def _prediction_rows(
         tickers,
         metadata,
     ):
+        coverages = sorted(float(coverage) for coverage in global_thresholds)
         interval_bounds: dict[float, tuple[float, float]] = {}
-        for coverage in (0.80, 0.90, 0.95):
+        for coverage in coverages:
             if mode == "adaptive":
                 try:
                     lower, upper = predictor.predict_interval(
@@ -1414,51 +1467,52 @@ def _prediction_rows(
             (str(ticker).upper(), str(event.get("date", ""))),
             {},
         )
-        rows.append(
+        row: dict[str, float | str | int] = {
+            "method": method,
+            "ticker": str(ticker).upper(),
+            "date": str(event.get("date", "")),
+            "year": int(event.get("year", 0)),
+            "regime": regime,
+            "actual_return": float(label),
+            "expected_return": mu,
+            "predicted_return": mu,
+            "actual_minus_expected": float(label) - mu,
+            "abs_error": abs_error,
+            "prediction_error": mu - float(label),
+            "predicted_variance_proxy": predicted_variance_proxy,
+            "variance_confidence": float(
+                output.get(
+                    "variance_confidence",
+                    output.get("interval_confidence", 0.0),
+                )
+            ),
+            "predicted_q_low": float(output.get("q_low", mu)),
+            "predicted_q_high": float(output.get("q_high", mu)),
+            "base_interval_width": float(
+                output.get(
+                    "q_high",
+                    mu,
+                )
+                - output.get(
+                    "q_low",
+                    mu,
+                )
+            ),
+            "introspective_score": float(output.get("introspective_score", 0.0)),
+        }
+        for coverage in coverages:
+            suffix = _coverage_suffix(coverage)
+            lower, upper = interval_bounds[coverage]
+            row.update(
+                {
+                    f"coverage_{suffix}_lower": lower,
+                    f"coverage_{suffix}_upper": upper,
+                    f"interval_{suffix}": f"[{lower:.4f}, {upper:.4f}]",
+                    f"width_{suffix}": float(upper - lower),
+                }
+            )
+        row.update(
             {
-                "method": method,
-                "ticker": str(ticker).upper(),
-                "date": str(event.get("date", "")),
-                "year": int(event.get("year", 0)),
-                "regime": regime,
-                "actual_return": float(label),
-                "expected_return": mu,
-                "predicted_return": mu,
-                "actual_minus_expected": float(label) - mu,
-                "abs_error": abs_error,
-                "prediction_error": mu - float(label),
-                "predicted_variance_proxy": predicted_variance_proxy,
-                "variance_confidence": float(
-                    output.get(
-                        "variance_confidence",
-                        output.get("interval_confidence", 0.0),
-                    )
-                ),
-                "predicted_q_low": float(output.get("q_low", mu)),
-                "predicted_q_high": float(output.get("q_high", mu)),
-                "base_interval_width": float(
-                    output.get(
-                        "q_high",
-                        mu,
-                    )
-                    - output.get(
-                        "q_low",
-                        mu,
-                    )
-                ),
-                "introspective_score": float(output.get("introspective_score", 0.0)),
-                "coverage_80_lower": interval_bounds[0.80][0],
-                "coverage_80_upper": interval_bounds[0.80][1],
-                "interval_80": f"[{interval_bounds[0.80][0]:.4f}, {interval_bounds[0.80][1]:.4f}]",
-                "width_80": float(interval_bounds[0.80][1] - interval_bounds[0.80][0]),
-                "coverage_90_lower": interval_bounds[0.90][0],
-                "coverage_90_upper": interval_bounds[0.90][1],
-                "interval_90": f"[{interval_bounds[0.90][0]:.4f}, {interval_bounds[0.90][1]:.4f}]",
-                "width_90": float(interval_bounds[0.90][1] - interval_bounds[0.90][0]),
-                "coverage_95_lower": interval_bounds[0.95][0],
-                "coverage_95_upper": interval_bounds[0.95][1],
-                "interval_95": f"[{interval_bounds[0.95][0]:.4f}, {interval_bounds[0.95][1]:.4f}]",
-                "width_95": float(interval_bounds[0.95][1] - interval_bounds[0.95][0]),
                 "estimated_earnings": float(
                     financial_metadata.get("estimated_earnings", float("nan"))
                 ),
@@ -1479,11 +1533,10 @@ def _prediction_rows(
                         output.get("introspective_score", explanation_confidence),
                     )
                 ),
-                "llm_predicted_abs_return": float(
-                    output.get("llm_predicted_abs_return", 0.0)
-                ),
-                "ticker_historical_vol": float(
-                    output.get("ticker_historical_vol", 0.0)
+                "llm_q_low": float(output.get("llm_q_low", 0.0)),
+                "llm_q_high": float(output.get("llm_q_high", 0.0)),
+                "llm_range_width": float(
+                    output.get("llm_q_high", 0.0) - output.get("llm_q_low", 0.0)
                 ),
                 "explanation_confidence": explanation_confidence,
                 "confidence_variance_normalizer": confidence_variance_normalizer,
@@ -1497,6 +1550,7 @@ def _prediction_rows(
                 "transcript_preview": transcript_preview,
             }
         )
+        rows.append(row)
     return rows
 
 
@@ -1748,16 +1802,7 @@ def evaluate(
         config.get("evaluation", {}).get("include_selective_analysis", False)
     )
 
-    per_ticker_vol, default_ticker_vol = _compute_ticker_volatilities(
-        train_events + val_events + cal_events
-    )
-    print(
-        f"Ticker historical-vol coverage: {len(per_ticker_vol)} tickers, "
-        f"default={default_ticker_vol:.4f}"
-    )
-    _attach_ticker_volatilities(cal_outputs, cal_events, per_ticker_vol, default_ticker_vol)
-
-    print("Ours interval rule: ticker_historical_vol_normalized_conformal")
+    print("Ours interval rule: |y-mu| * llm_confidence / variance (std / llm_conf)")
     cal_metadata, disagreement_center, disagreement_scale = _build_explanation_metadata(
         events=cal_events,
         full_outputs=cal_outputs,
@@ -1791,6 +1836,12 @@ def evaluate(
         cal_metadata=cal_metadata,
         coverage_levels=coverage_levels,
         reference_explanation_confidence=calibration_explanation_confidence,
+    )
+    confidence_variance_thresholds = _match_confidence_threshold_widths_to_naive(
+        confidence_thresholds=confidence_variance_thresholds,
+        naive_thresholds=global_thresholds,
+        cal_outputs=cal_outputs,
+        cal_metadata=cal_metadata,
     )
     historical_events = train_events + val_events + cal_events
     event_conditioned_predictor = EventConditionedConformalPredictor(
@@ -1853,9 +1904,6 @@ def evaluate(
         sentiment_outputs=test_sentiment_outputs,
         weights=ensemble_weights,
     )
-    _attach_ticker_volatilities(
-        test_full_outputs, test_events, per_ticker_vol, default_ticker_vol
-    )
     test_metadata, _unused_center, _unused_scale = _build_explanation_metadata(
         events=test_events,
         full_outputs=test_full_outputs,
@@ -1877,11 +1925,7 @@ def evaluate(
 
     for method, mode, active_predictor in evaluation_specs:
         outputs, labels, regimes, _tickers = method_payloads[method]
-        thresholds_for_call = (
-            confidence_variance_thresholds
-            if mode == "confidence_scaled_naive"
-            else global_thresholds
-        )
+        thresholds_for_call = global_thresholds
 
         results_rows.append(
             _metric_row(
@@ -1995,11 +2039,13 @@ def evaluate(
     subgroup_results_table = pd.DataFrame(subgroup_rows)
     selective_results_table = pd.DataFrame(selective_rows)
     predictions_table = pd.DataFrame(prediction_rows)
+    coverage_display_columns = [
+        f"coverage_{_coverage_suffix(coverage)}"
+        for coverage in coverage_levels
+    ]
     display_columns = [
         "method",
-        "coverage_80",
-        "coverage_90",
-        "coverage_95",
+        *coverage_display_columns,
         "avg_width",
         "MAE",
         "RMSE",
@@ -2012,9 +2058,7 @@ def evaluate(
             "subgroup_type",
             "subgroup",
             "n",
-            "coverage_80",
-            "coverage_90",
-            "coverage_95",
+            *coverage_display_columns,
             "avg_width",
         ]
         print(

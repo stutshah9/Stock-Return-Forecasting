@@ -475,6 +475,7 @@ srun --account=cp-spring2026-iac \
      --pty bash -l
 source stock_forecasting_py311_venv/bin/activate
 cd earnings_forecast
+rm data/llm_cache.json
 python3 experiments/train.py
 python experiments/evaluate.py \
   --use-llm \
