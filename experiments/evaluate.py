@@ -437,9 +437,7 @@ def _build_explanation_metadata(
         if "llm_confidence" in full_output:
             llm_confidence = min(max(float(full_output["llm_confidence"]), 0.0), 1.0)
         else:
-            llm_confidence = _confidence_from_explanation_string(
-                str(full_output.get("explanation", ""))
-            )
+            llm_confidence = model_confidence
         metadata_rows.append(
             {
                 **base_metadata,
