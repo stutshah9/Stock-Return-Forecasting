@@ -1,7 +1,0 @@
-=== build_cache @ Sat May  2 18:23:02 EDT 2026 ===
-Traceback (most recent call last):
-  File "/Users/Stuti/Stock-Return-Forecasting/data/build_cache.py", line 20, in <module>
-    from encoders.sentiment_encoder import aggregate_posts
-  File "/Users/Stuti/Stock-Return-Forecasting/encoders/sentiment_encoder.py", line 11, in <module>
-    from textblob import TextBlob
-ModuleNotFoundError: No module named 'textblob'
