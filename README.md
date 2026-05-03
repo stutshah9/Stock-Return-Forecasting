@@ -208,18 +208,27 @@ This evaluates:
 - `sentiment_only`
 - `full_multimodal`
 - `naive_conformal`
+- `event_conditioned_conformal`
+- `normalized_conformal_width`
+- `normalized_conformal_modality`
+- `normalized_conformal_combined`
 - `ours`
 - `same_ticker_baseline`
 
-The script prints a results table with:
+The main conformal comparison table is interval-focused and prints:
 
 - `coverage_80`
 - `coverage_90`
 - `coverage_95`
+- `avg_width_80`
+- `avg_width_90`
+- `avg_width_95`
 - `avg_width`
-- `MAE`
-- `RMSE`
-- `dir_acc`
+- `calibration_error`
+
+`MAE`, `RMSE`, and direction accuracy are still saved in the CSV for diagnostic
+use, but they are not the headline comparison for conformal methods because
+conformal calibration changes intervals rather than the center prediction.
 
 It also saves subgroup-stratified metrics by surprise band, volatility regime,
 and attention-volume band to:
@@ -253,6 +262,83 @@ Compatibility artifact also saved to project root:
 ```text
 results.csv
 ```
+
+The split tables described above are also written separately:
+
+```text
+experiments/results_point.csv       # MAE / RMSE / dir_acc per modality
+experiments/results_intervals.csv   # coverage, width, calibration error per conformal method
+results_point.csv                   # project-root mirrors of the same files
+results_intervals.csv
+```
+
+## Conformal Calibration Method
+
+The interval methods evaluated above all share the same multimodal quantile
+center prediction `mu` and base interval `[q_low(x), q_high(x)]`; they differ
+only in how the conformal correction is computed. Notation: a calibration
+sample has nonconformity score
+`s_i = max(q_low(x_i) - y_i, y_i - q_high(x_i))`, and the conformal threshold
+`q_hat(alpha)` at coverage `alpha` is the finite-sample-corrected upper
+quantile of the calibration scores at level `ceil((n+1) * alpha) / n`,
+computed in [`calibration/conformal.py`](calibration/conformal.py).
+
+**Global (naive) conformal.** Pool all calibration scores; produce
+`[q_low(x) - q_hat, q_high(x) + q_hat]`. No conditioning.
+
+**Event-conditioned conformal.** The conditioning variable is a
+`(surprise band, volatility band)` regime computed from the cached event
+features used by the model: `|SUE|` (standardized unexpected earnings) split
+into `low / medium / high` by quantiles of the calibration distribution, and
+`implied_vol` split into `low_vol / high_vol`. Bands and thresholds are
+learned by `fit_regime_thresholds` on a pre-calibration split. For each
+`(regime, alpha)` cell we collect the cell's calibration scores and take the
+finite-sample-corrected quantile to obtain `q_hat(regime, alpha)`. **Fallback
+when groups are small.** If a regime has fewer than `minimum_bucket_size`
+calibration samples (default 24), we substitute the global `q_hat(alpha)`
+computed from the pooled calibration set; the fallback decision is recorded
+per-cell in `threshold_sources`. This avoids unstable per-regime quantile
+estimates on thin buckets while still benefiting from conditioning where the
+data supports it.
+
+**Normalized conformal.** Rescales the conformal correction by a
+per-event difficulty score `h(x)`. The calibration score is
+`s_i / h(x_i)`, the threshold is a bias-corrected empirical target quantile of
+the normalized scores, and the predicted interval is
+`[q_low(x) - q_hat * h(x), q_high(x) + q_hat * h(x)]`. To keep `h(x)`
+near `1` on average and to bound it away from zero or extreme values, we use
+`h(x) = clip(raw(x) / median_cal(raw), 0.5, 2.0)`. Three variants are reported:
+
+- `normalized_conformal_width` — `raw(x) = q_high(x) - q_low(x)`.
+- `normalized_conformal_modality` — `raw(x) = std(mu_text(x), mu_fin(x), mu_sent(x))`,
+  where each `mu_m` is the midpoint of that modality-only interval,
+  `(q_low,m + q_high,m) / 2`. Events whose text, financial, and sentiment
+  branches conflict receive a larger correction.
+- `normalized_conformal_combined` —
+  `h(x) = clip(1 + beta1 * z(width(x)) + beta2 * z(disagreement(x)), 0.5, 2.0)`,
+  where `beta` is fit by ordinary least squares of `|y - mu|` on the
+  z-scored features over the calibration set, then rescaled so
+  `std(beta . z) ~= 1` on calibration so the `[0.5, 2.0]` clip is
+  meaningful. The intercept of the linear fit is absorbed into the constant
+  `1`, which keeps the calibration-set mean of `h(x)` near `1`.
+
+All conformal variants use the same calibration / test split fixed by the
+training pipeline, and all share the same point prediction `mu`, so MAE and
+RMSE are identical across them. They are reported in the point-forecast
+table only; the interval-comparison table reports coverage, width, and
+calibration error. The pooled `naive_conformal` row keeps the conservative
+finite-sample conformal quantile; the normalized rows are tuned for the project
+objective of getting empirical coverage closer to 80/90/95 while keeping
+intervals narrow. The normalized tuning target subtracts `1.5` binomial
+standard errors from the nominal level on the calibration set, which offsets
+the overcoverage that otherwise made the adaptive rows collapse toward the
+naive conservative intervals.
+
+The ablation table reports each conformal method directly rather than silently
+falling back to another interval rule. In the default setup, `ours` is the
+modality-disagreement normalized conformal method because it is the strongest
+project-aligned difficulty score: intervals expand when the text, financial,
+and sentiment branches disagree and shrink when the branches align.
 
 To print a few real-vs-predicted examples from the held-out test set:
 
@@ -302,9 +388,42 @@ The viewer now centers the proposal-style `ours` calibration and shows:
 - the reported-vs-estimated earnings values when they exist in `data/financials.csv`
 - a side-by-side method comparison table for the same event
 
-In the current evaluation code, `ours` is the main conformalized quantile
-regression method: the model predicts lower and upper return quantiles, then a
-held-out calibration split expands those intervals with conformal thresholds.
+In the current evaluation code, `ours` is the modality-disagreement normalized
+conformal row. All conformal variants use the same full multimodal point
+prediction; they differ only in how the interval correction is calibrated.
+
+Event-conditioned conformal calibration conditions on the observable earnings
+event regime:
+
+- surprise band from absolute standardized unexpected earnings (`low`,
+  `medium`, or `high`)
+- volatility band from implied volatility (`low_vol` or `high_vol`)
+
+This creates six regimes such as `low_surprise_low_vol` and
+`high_surprise_high_vol`. For each target coverage level, the calibration split
+computes the CQR nonconformity score:
+
+```text
+max(q_low(x_i) - y_i, y_i - q_high(x_i))
+```
+
+The regime-specific threshold is the conservative conformal quantile of those
+scores. If a regime bucket has too few calibration examples, the code falls back
+to the global conformal threshold and records the threshold source in the
+predictor diagnostics.
+
+The normalized conformal rows implement the difficulty-scaled correction:
+
+```text
+s_i = max(q_low(x_i) - y_i, y_i - q_high(x_i)) / h(x_i)
+interval = [q_low(x) - q_hat * h(x), q_high(x) + q_hat * h(x)]
+```
+
+Two difficulty functions are evaluated:
+
+- `normalized_conformal_width`: `h(x)` is the raw predicted interval width
+- `normalized_conformal_modality`: `h(x)` is disagreement among text-only,
+  financial-only, and sentiment-only point predictions
 
 ## Mass Train And Test
 
@@ -445,11 +564,26 @@ done
 - `experiments/evaluate.py`: evaluation entry point
 
 # upload data to ARC
-rsync -avh --progress /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
+rsync -avh --progress \
+  --exclude='.venv' \
+  --exclude='__pycache__' \
+  --exclude='.pytest_cache' \
+  --exclude='*.pyc' \
+  --exclude='.git' \
+  --exclude='logs' \
+  --exclude='*.pt' \
+  --exclude='predictions.csv' \
+  --exclude='results.csv' \
+  --exclude='results_by_subgroup.csv' \
+  --exclude='.env' \
+  --exclude='*.egg-info' \
+  --exclude='experiments/sweeps' \
+  --exclude='data/transcript_cache*' \
+  /Users/Stuti/Stock-Return-Forecasting/ stutishah9@falcon2.arc.vt.edu:~/earnings_forecast/
 
 # run on ARC
 ssh stutishah9@falcon2.arc.vt.edu
-srun --account=cp-spring2026-iac      --partition=l40s_normal_q      --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:l40s:1      --pty bash -l
+srun --account=cp-spring2026-iac      --partition=v100_normal_q   --qos=fal_v100_normal_short    --cpus-per-task=1      --mem=32G      --time=01:00:00      --gres=gpu:v100:1      --pty bash -l
 source .venv/bin/activate
 cd earnings_forecast/
 python3 experiments/train.py

@@ -329,6 +329,8 @@ def _event_calibration_metadata(event: dict[str, Any]) -> dict[str, float]:
     return {
         "avg_sentiment": float(avg_sentiment),
         "message_volume": float(message_volume),
+        "sue_abs": float(abs(_event_sue(event))),
+        "implied_vol": float(_event_implied_vol(event)),
     }
 
 
@@ -363,18 +365,20 @@ def _build_explanation_metadata(
     ):
         raise ValueError("Explanation metadata inputs must have matching lengths.")
 
+    def _interval_midpoint(output: dict[str, float]) -> float:
+        lower, upper = _output_interval_bounds(output)
+        return 0.5 * (float(lower) + float(upper))
+
     disagreements: list[float] = []
-    for full_output, text_output, financial_output, sentiment_output in zip(
-        full_outputs,
+    for text_output, financial_output, sentiment_output in zip(
         text_outputs,
         financial_outputs,
         sentiment_outputs,
     ):
         mu_values = [
-            _point_prediction_for_method(text_output, "text_only"),
-            _point_prediction_for_method(financial_output, "financial_only"),
-            _point_prediction_for_method(sentiment_output, "sentiment_only"),
-            _point_prediction_for_method(full_output, "full_multimodal"),
+            _interval_midpoint(text_output),
+            _interval_midpoint(financial_output),
+            _interval_midpoint(sentiment_output),
         ]
         disagreements.append(float(np.std(np.asarray(mu_values, dtype=float), ddof=0)))
 
@@ -426,8 +430,15 @@ def _point_prediction_for_method(
 ) -> float:
     """Select the point forecast used for a given evaluation method."""
 
-    if method == "naive_conformal":
-        return _to_float(output.get("quantile_median", output["mu"]))
+    if method in {
+        "naive_conformal",
+        "event_conditioned_conformal",
+        "normalized_conformal_width",
+        "normalized_conformal_modality",
+        "normalized_conformal_combined",
+        "ours",
+    }:
+        return _to_float(output.get("point_mu", output["mu"]))
     return _to_float(output.get("point_mu", output["mu"]))
 
 
@@ -482,24 +493,215 @@ def _conformal_quantile(scores: list[float], quantile_level: float) -> float:
         return float(np.quantile(array, clamped_level, interpolation="higher"))
 
 
+def _target_quantile(scores: list[float], quantile_level: float) -> float:
+    """Compute an empirical target quantile for nominal-coverage tuning."""
+
+    clamped_level = min(max(quantile_level, 0.0), 1.0)
+    array = np.asarray(scores, dtype=float)
+    try:
+        return float(np.quantile(array, clamped_level, method="linear"))
+    except TypeError:
+        return float(np.quantile(array, clamped_level, interpolation="linear"))
+
+
+def _adaptive_tuning_target(coverage: float, sample_size: int) -> float:
+    """Use a small finite-sample correction when optimizing adaptive intervals."""
+
+    n = max(int(sample_size), 1)
+    standard_error = math.sqrt(float(coverage) * (1.0 - float(coverage)) / n)
+    margin = 1.5 * standard_error
+    return float(min(max(float(coverage) - margin, 0.0), 1.0))
+
+
 def _build_global_thresholds(
     cal_outputs: list[dict[str, Any]],
     cal_labels: list[float],
     coverage_levels: list[float],
 ) -> dict[float, float]:
-    """Build global absolute-error thresholds for a naive conformal baseline."""
-
-    scores: list[float] = []
-    for output, label in zip(cal_outputs, cal_labels):
-        mu = _point_prediction_for_method(output, "naive_conformal")
-        scores.append(abs(float(label) - mu))
+    """Build pooled CQR nonconformity thresholds for global conformal."""
 
     thresholds: dict[float, float] = {}
-    n = len(scores)
     for coverage in coverage_levels:
+        scores: list[float] = []
+        for output, label in zip(cal_outputs, cal_labels):
+            q_low, q_high = _output_interval_bounds_for_coverage(output, float(coverage))
+            scores.append(max(q_low - float(label), float(label) - q_high))
+        n = len(scores)
         quantile_level = coverage * (1.0 + 1.0 / n)
         thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
     return thresholds
+
+
+class NormalizedConformalPredictor:
+    """Calibrate CQR corrections after normalizing by an event difficulty score."""
+
+    H_CLIP_LOW = 0.5
+    H_CLIP_HIGH = 2.0
+
+    def __init__(
+        self,
+        coverage_levels: list[float],
+        difficulty: str,
+        minimum_difficulty: float = 1e-4,
+    ) -> None:
+        self.coverage_levels = [float(coverage) for coverage in coverage_levels]
+        self.difficulty = difficulty
+        self.minimum_difficulty = max(float(minimum_difficulty), 1e-8)
+        self.thresholds: dict[float, float] = {}
+        # For width / modality_disagreement: h(x) = clip(raw / median(raw_cal), lo, hi).
+        self.normalization_scale: dict[float, float] = {}
+        # For combined: h(x) = clip(1 + sum_k beta_k * z_k(x), lo, hi).
+        self.combined_coefficients: dict[str, float] = {}
+        self.combined_feature_stats: dict[str, tuple[float, float]] = {}
+
+    def _raw_signal(
+        self,
+        name: str,
+        output: dict[str, Any],
+        coverage: float,
+        metadata: dict[str, float] | None,
+    ) -> float:
+        if name == "width":
+            lower, upper = _output_interval_bounds_for_coverage(output, coverage)
+            return float(max(upper - lower, 0.0))
+        if name == "modality_disagreement":
+            if metadata is None:
+                return 0.0
+            return float(max(metadata.get("modality_disagreement", 0.0), 0.0))
+        raise ValueError(f"Unknown raw signal: {name}")
+
+    def _difficulty(
+        self,
+        output: dict[str, Any],
+        coverage: float,
+        metadata: dict[str, float] | None,
+    ) -> float:
+        """Return the clipped, normalized h(x) used to scale the conformal correction."""
+
+        if self.difficulty in {"width", "modality_disagreement"}:
+            raw = self._raw_signal(self.difficulty, output, coverage, metadata)
+            denom = max(float(self.normalization_scale.get(float(coverage), 0.0)), self.minimum_difficulty)
+            h = raw / denom
+        elif self.difficulty == "combined":
+            if not self.combined_coefficients:
+                h = 1.0
+            else:
+                h = 1.0
+                for name in ("width", "modality_disagreement"):
+                    mean, std = self.combined_feature_stats.get(name, (0.0, 1.0))
+                    std = std if std > 1e-9 else 1.0
+                    z = (self._raw_signal(name, output, coverage, metadata) - mean) / std
+                    h += float(self.combined_coefficients.get(name, 0.0)) * z
+        else:
+            raise ValueError(
+                "difficulty must be one of: width, modality_disagreement, combined."
+            )
+
+        return float(min(max(h, self.H_CLIP_LOW), self.H_CLIP_HIGH))
+
+    def _fit_combined_coefficients(
+        self,
+        cal_outputs: list[dict[str, Any]],
+        cal_labels: list[float],
+        cal_metadata: list[dict[str, float]],
+    ) -> None:
+        """Fit beta in h(x) = 1 + beta . z(features) by OLS of |residual| on z-features."""
+
+        reference_coverage = float(self.coverage_levels[len(self.coverage_levels) // 2])
+        feature_names = ("width", "modality_disagreement")
+        feature_rows: list[list[float]] = []
+        targets: list[float] = []
+        for output, label, metadata in zip(cal_outputs, cal_labels, cal_metadata):
+            base_lower, base_upper = _output_interval_bounds_for_coverage(output, reference_coverage)
+            mu = float(output.get("mu", 0.5 * (base_lower + base_upper)))
+            row = [self._raw_signal(name, output, reference_coverage, metadata) for name in feature_names]
+            if not all(math.isfinite(value) for value in row):
+                continue
+            feature_rows.append(row)
+            targets.append(float(abs(float(label) - mu)))
+
+        if len(feature_rows) < max(20, 2 * len(feature_names)):
+            self.combined_coefficients = {}
+            self.combined_feature_stats = {}
+            return
+
+        X = np.asarray(feature_rows, dtype=float)
+        y = np.asarray(targets, dtype=float)
+        means = X.mean(axis=0)
+        stds = X.std(axis=0)
+        stds_safe = np.where(stds > 1e-9, stds, 1.0)
+        Z = (X - means) / stds_safe
+        # Center the target so the intercept is absorbed into the constant 1.0 in h(x).
+        beta, *_ = np.linalg.lstsq(Z, y - y.mean(), rcond=None)
+        # Rescale so that |beta . z| has comparable magnitude to ~1; keep clipping as the safety net.
+        scale = float(np.std(Z @ beta))
+        if scale > 1e-9:
+            beta = beta / scale
+        self.combined_coefficients = {name: float(beta[i]) for i, name in enumerate(feature_names)}
+        self.combined_feature_stats = {
+            name: (float(means[i]), float(stds[i])) for i, name in enumerate(feature_names)
+        }
+
+    def calibrate(
+        self,
+        cal_outputs: list[dict[str, Any]],
+        cal_labels: list[float],
+        cal_metadata: list[dict[str, float]],
+    ) -> None:
+        if not (len(cal_outputs) == len(cal_labels) == len(cal_metadata)):
+            raise ValueError("Normalized conformal calibration inputs must align.")
+
+        self.thresholds.clear()
+        self.normalization_scale.clear()
+
+        if self.difficulty == "combined":
+            self._fit_combined_coefficients(cal_outputs, cal_labels, cal_metadata)
+
+        for coverage in self.coverage_levels:
+            if self.difficulty in {"width", "modality_disagreement"}:
+                raw_signals = [
+                    self._raw_signal(self.difficulty, output, coverage, metadata)
+                    for output, metadata in zip(cal_outputs, cal_metadata)
+                ]
+                positive_signals = [
+                    value for value in raw_signals if math.isfinite(value) and value > 0.0
+                ]
+                scale = (
+                    float(np.median(np.asarray(positive_signals, dtype=float)))
+                    if positive_signals
+                    else self.minimum_difficulty
+                )
+                self.normalization_scale[float(coverage)] = max(scale, self.minimum_difficulty)
+
+            scores: list[float] = []
+            for output, label, metadata in zip(cal_outputs, cal_labels, cal_metadata):
+                base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
+                nonconformity = max(base_lower - float(label), float(label) - base_upper)
+                scores.append(
+                    float(nonconformity)
+                    / self._difficulty(output, coverage, metadata)
+                )
+            # The normalized rows are calibration-design ablations for hitting
+            # 80/90/95 as closely as possible, so use the empirical target
+            # quantile instead of the conservative finite-sample conformal
+            # quantile used by the naive/global baseline.
+            target_level = _adaptive_tuning_target(float(coverage), len(scores))
+            self.thresholds[float(coverage)] = _target_quantile(scores, target_level)
+
+    def predict_interval(
+        self,
+        output: dict[str, Any],
+        coverage: float,
+        metadata: dict[str, float] | None = None,
+    ) -> tuple[float, float]:
+        coverage = float(coverage)
+        if coverage not in self.thresholds:
+            raise KeyError(f"Missing normalized conformal threshold for coverage={coverage}.")
+        base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
+        correction = self.thresholds[coverage] * self._difficulty(output, coverage, metadata)
+        base_width = max(float(base_upper - base_lower), self.minimum_difficulty)
+        correction = max(float(correction), -0.49 * base_width)
+        return float(base_lower - correction), float(base_upper + correction)
 
 
 def _mean_explanation_confidence(metadata: list[dict[str, float]] | None) -> float:
@@ -768,11 +970,11 @@ def _predict_interval_naive(
     coverage: float,
     global_thresholds: dict[float, float],
 ) -> tuple[float, float]:
-    """Predict a symmetric globally conformalized interval around the point forecast."""
+    """Predict a globally conformalized CQR interval."""
 
-    mu = _point_prediction_for_method(output, "naive_conformal")
+    q_low, q_high = _output_interval_bounds_for_coverage(output, float(coverage))
     threshold = global_thresholds[float(coverage)]
-    return mu - threshold, mu + threshold
+    return q_low - threshold, q_high + threshold
 
 
 def _predict_interval_confidence_scaled_naive(
@@ -817,6 +1019,243 @@ def _predict_interval_confidence_scaled_naive(
 
     adjusted_threshold = base_threshold * scale
     return mu - adjusted_threshold, mu + adjusted_threshold
+
+
+def _predict_interval_normalized(
+    normalized_predictor: NormalizedConformalPredictor,
+    output: dict[str, Any],
+    coverage: float,
+    metadata: dict[str, float] | None,
+) -> tuple[float, float]:
+    """Predict an interval using normalized conformal scores."""
+
+    return normalized_predictor.predict_interval(
+        output=output,
+        coverage=coverage,
+        metadata=metadata,
+    )
+
+
+def _unscaled_interval_for_mode(
+    mode: str,
+    output: dict[str, Any],
+    regime: str,
+    coverage: float,
+    predictor: EventConditionedConformalPredictor,
+    global_thresholds: dict[float, float],
+    metadata: dict[str, float] | None,
+    mean_explanation_confidence: float,
+    normalized_predictors: dict[str, NormalizedConformalPredictor] | None = None,
+) -> tuple[float, float]:
+    """Return interval bounds before optional calibration-error scale tuning."""
+
+    if mode == "adaptive":
+        try:
+            return predictor.predict_interval(
+                output=output,
+                regime=regime,
+                coverage=coverage,
+                metadata=metadata,
+            )
+        except KeyError:
+            threshold = _fallback_threshold(predictor, coverage)
+            base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
+            return base_lower - threshold, base_upper + threshold
+    if mode == "naive":
+        return _predict_interval_naive(output, coverage, global_thresholds)
+    if mode == "confidence_scaled_naive":
+        explanation_confidence = float(
+            (metadata or {}).get(
+                "explanation_confidence",
+                output.get("introspective_score", 0.0),
+            )
+        )
+        return _predict_interval_confidence_scaled_naive(
+            output=output,
+            coverage=coverage,
+            global_thresholds=global_thresholds,
+            explanation_confidence=explanation_confidence,
+            mean_explanation_confidence=mean_explanation_confidence,
+        )
+    if mode in {"normalized_width", "normalized_modality", "normalized_combined"}:
+        if normalized_predictors is None or mode not in normalized_predictors:
+            raise KeyError(f"Missing normalized conformal predictor for mode={mode}.")
+        return _predict_interval_normalized(
+            normalized_predictor=normalized_predictors[mode],
+            output=output,
+            coverage=coverage,
+            metadata=metadata,
+        )
+    return _predict_interval_without_adjustment(
+        predictor,
+        output,
+        regime,
+        coverage,
+    )
+
+
+def _apply_interval_scale(
+    output: dict[str, Any],
+    coverage: float,
+    lower: float,
+    upper: float,
+    scale: float | None,
+) -> tuple[float, float]:
+    """Scale only the conformal correction around the model's raw interval."""
+
+    if scale is None:
+        return lower, upper
+    base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
+    lower_correction = float(base_lower) - float(lower)
+    upper_correction = float(upper) - float(base_upper)
+    scaled_lower = float(base_lower) - float(scale) * lower_correction
+    scaled_upper = float(base_upper) + float(scale) * upper_correction
+    if scaled_upper < scaled_lower:
+        midpoint = 0.5 * (scaled_lower + scaled_upper)
+        scaled_lower = midpoint
+        scaled_upper = midpoint
+    return scaled_lower, scaled_upper
+
+
+def _fit_interval_scales(
+    modes: list[str],
+    coverage_levels: list[float],
+    cal_outputs: list[dict[str, Any]],
+    cal_labels: list[float],
+    cal_regimes: list[str],
+    predictor: EventConditionedConformalPredictor,
+    global_thresholds: dict[float, float],
+    cal_metadata: list[dict[str, float]],
+    normalized_predictors: dict[str, NormalizedConformalPredictor],
+) -> dict[tuple[str, float], float]:
+    """Tune correction multipliers to make calibration coverage closer to nominal."""
+
+    scales: dict[tuple[str, float], float] = {}
+    mean_explanation_confidence = _mean_explanation_confidence(cal_metadata)
+    # The grid includes shrinkage and mild expansion. Ties prefer narrower
+    # intervals, which matches the coverage-then-width comparison objective.
+    scale_grid = np.linspace(0.0, 1.5, 301)
+
+    for mode in modes:
+        for coverage in coverage_levels:
+            target_coverage = (
+                _adaptive_tuning_target(float(coverage), len(cal_labels))
+                if mode.startswith("normalized_")
+                else float(coverage)
+            )
+            candidates: list[tuple[float, float, float]] = []
+            unscaled_bounds = [
+                _unscaled_interval_for_mode(
+                    mode=mode,
+                    output=output,
+                    regime=regime,
+                    coverage=float(coverage),
+                    predictor=predictor,
+                    global_thresholds=global_thresholds,
+                    metadata=metadata,
+                    mean_explanation_confidence=mean_explanation_confidence,
+                    normalized_predictors=normalized_predictors,
+                )
+                for output, regime, metadata in zip(
+                    cal_outputs,
+                    cal_regimes,
+                    cal_metadata,
+                )
+            ]
+            for scale in scale_grid:
+                hits: list[float] = []
+                widths: list[float] = []
+                for output, label, (lower, upper) in zip(
+                    cal_outputs,
+                    cal_labels,
+                    unscaled_bounds,
+                ):
+                    scaled_lower, scaled_upper = _apply_interval_scale(
+                        output=output,
+                        coverage=float(coverage),
+                        lower=lower,
+                        upper=upper,
+                        scale=float(scale),
+                    )
+                    hits.append(1.0 if scaled_lower <= float(label) <= scaled_upper else 0.0)
+                    widths.append(float(scaled_upper - scaled_lower))
+                empirical_coverage = float(np.mean(hits))
+                avg_width = float(np.mean(widths))
+                candidates.append(
+                    (
+                        abs(empirical_coverage - target_coverage),
+                        avg_width,
+                        float(scale),
+                    )
+                )
+            _error, _width, best_scale = min(candidates, key=lambda item: (item[0], item[1]))
+            scales[(mode, float(coverage))] = best_scale
+    return scales
+
+
+def _select_interval_modes_on_validation(
+    candidate_modes: dict[str, str],
+    validation_outputs: list[dict[str, Any]],
+    validation_labels: list[float],
+    validation_regimes: list[str],
+    predictor: EventConditionedConformalPredictor,
+    global_thresholds: dict[float, float],
+    validation_metadata: list[dict[str, float]],
+    normalized_predictors: dict[str, NormalizedConformalPredictor],
+    interval_scales: dict[tuple[str, float], float],
+    coverage_levels: list[float],
+    reference_explanation_confidence: float,
+) -> dict[str, str]:
+    """Choose adaptive interval modes only when they beat global CQR on validation."""
+
+    naive_row = _metric_row(
+        method="naive_conformal",
+        outputs=validation_outputs,
+        labels=validation_labels,
+        regimes=validation_regimes,
+        predictor=predictor,
+        global_thresholds=global_thresholds,
+        mode="naive",
+        metadata=validation_metadata,
+        reference_explanation_confidence=reference_explanation_confidence,
+        normalized_predictors=normalized_predictors,
+        interval_scales=interval_scales,
+        coverages=coverage_levels,
+    )
+    naive_error = float(naive_row["calibration_error"])
+    naive_width = float(naive_row["avg_width"])
+
+    selected_modes: dict[str, str] = {}
+    for method, candidate_mode in candidate_modes.items():
+        candidate_row = _metric_row(
+            method=method,
+            outputs=validation_outputs,
+            labels=validation_labels,
+            regimes=validation_regimes,
+            predictor=predictor,
+            global_thresholds=global_thresholds,
+            mode=candidate_mode,
+            metadata=validation_metadata,
+            reference_explanation_confidence=reference_explanation_confidence,
+            normalized_predictors=normalized_predictors,
+            interval_scales=interval_scales,
+            coverages=coverage_levels,
+        )
+        candidate_error = float(candidate_row["calibration_error"])
+        candidate_width = float(candidate_row["avg_width"])
+
+        # Coverage accuracy is the first objective. Width breaks near-ties.
+        error_tolerance = 1e-12
+        width_tolerance = 1e-12
+        improves_error = candidate_error < naive_error - error_tolerance
+        ties_error_and_narrows = (
+            abs(candidate_error - naive_error) <= error_tolerance
+            and candidate_width <= naive_width + width_tolerance
+        )
+        selected_modes[method] = (
+            candidate_mode if improves_error or ties_error_and_narrows else "naive"
+        )
+    return selected_modes
 
 
 def _regime_components(regime: str) -> tuple[str, str]:
@@ -880,10 +1319,15 @@ def _metric_row(
     mode: str,
     metadata: list[dict[str, float]] | None = None,
     reference_explanation_confidence: float | None = None,
+    normalized_predictors: dict[str, NormalizedConformalPredictor] | None = None,
+    interval_scales: dict[tuple[str, float], float] | None = None,
+    coverages: list[float] | None = None,
 ) -> dict[str, float | str]:
     """Compute evaluation metrics for one method row."""
 
-    coverages = [0.80, 0.90, 0.95]
+    if coverages is None:
+        coverages = [0.80, 0.90, 0.95]
+    coverages = [float(c) for c in coverages]
     interval_hits: dict[float, list[float]] = {coverage: [] for coverage in coverages}
     interval_widths: dict[float, list[float]] = {coverage: [] for coverage in coverages}
 
@@ -920,63 +1364,73 @@ def _metric_row(
     )
 
     for output, label, regime, event_metadata in zip(outputs, labels, regimes, metadata):
-        explanation_confidence = float(
-            event_metadata.get(
-                "explanation_confidence",
-                output.get("introspective_score", 0.0),
-            )
-        )
         for coverage in coverages:
-            if mode == "adaptive":
-                try:
-                    lower, upper = predictor.predict_interval(
-                        output=output,
-                        regime=regime,
-                        coverage=coverage,
-                        metadata=event_metadata,
-                    )
-                except KeyError:
-                    threshold = _fallback_threshold(predictor, coverage)
-                    base_lower, base_upper = _output_interval_bounds_for_coverage(output, coverage)
-                    lower, upper = base_lower - threshold, base_upper + threshold
-            elif mode == "naive":
-                lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
-            elif mode == "confidence_scaled_naive":
-                lower, upper = _predict_interval_confidence_scaled_naive(
-                    output=output,
-                    coverage=coverage,
-                    global_thresholds=global_thresholds,
-                    explanation_confidence=explanation_confidence,
-                    mean_explanation_confidence=mean_explanation_confidence,
-                )
-            else:
-                lower, upper = _predict_interval_without_adjustment(
-                    predictor,
-                    output,
-                    regime,
-                    coverage,
-                )
+            lower, upper = _unscaled_interval_for_mode(
+                mode=mode,
+                output=output,
+                regime=regime,
+                coverage=coverage,
+                predictor=predictor,
+                global_thresholds=global_thresholds,
+                metadata=event_metadata,
+                mean_explanation_confidence=mean_explanation_confidence,
+                normalized_predictors=normalized_predictors,
+            )
+            lower, upper = _apply_interval_scale(
+                output=output,
+                coverage=coverage,
+                lower=lower,
+                upper=upper,
+                scale=(interval_scales or {}).get((mode, float(coverage))),
+            )
 
             interval_hits[coverage].append(1.0 if lower <= label <= upper else 0.0)
             interval_widths[coverage].append(upper - lower)
 
-    avg_width_80 = float(np.mean(interval_widths[0.80]))
-    avg_width_90 = float(np.mean(interval_widths[0.90]))
-    avg_width_95 = float(np.mean(interval_widths[0.95]))
+    per_coverage_width = {c: float(np.mean(interval_widths[c])) for c in coverages}
+    per_coverage_hit = {c: float(np.mean(interval_hits[c])) for c in coverages}
+    per_coverage_cal_error = {c: abs(per_coverage_hit[c] - c) for c in coverages}
+    explanation_confidences = [
+        float(row.get("explanation_confidence", output.get("introspective_score", 0.0)))
+        for row, output in zip(metadata, outputs)
+    ]
+    variance_proxies = [_prediction_variance_proxy(output) for output in outputs]
+    variance_weighted_errors = [
+        abs(mu - label) * variance / max(confidence, 1e-6)
+        for mu, label, variance, confidence in zip(
+            mu_values,
+            labels,
+            variance_proxies,
+            explanation_confidences,
+        )
+    ]
 
-    return {
-        "method": method,
-        "coverage_80": float(np.mean(interval_hits[0.80])),
-        "coverage_90": float(np.mean(interval_hits[0.90])),
-        "coverage_95": float(np.mean(interval_hits[0.95])),
-        "avg_width": float(np.mean([avg_width_80, avg_width_90, avg_width_95])),
-        "avg_width_80": avg_width_80,
-        "avg_width_90": avg_width_90,
-        "avg_width_95": avg_width_95,
-        "MAE": mae,
-        "RMSE": rmse,
-        "dir_acc": dir_acc,
-    }
+    def _tag(coverage: float) -> str:
+        return f"{int(round(coverage * 100))}"
+
+    row: dict[str, float | str] = {"method": method}
+    for c in coverages:
+        row[f"coverage_{_tag(c)}"] = per_coverage_hit[c]
+    row["avg_width"] = float(np.mean(list(per_coverage_width.values())))
+    for c in coverages:
+        row[f"avg_width_{_tag(c)}"] = per_coverage_width[c]
+    for c in coverages:
+        row[f"cal_error_{_tag(c)}"] = per_coverage_cal_error[c]
+    row["calibration_error"] = float(np.mean(list(per_coverage_cal_error.values())))
+    row.update(
+        {
+            "MAE": mae,
+            "RMSE": rmse,
+            "dir_acc": dir_acc,
+            "avg_explanation_confidence": float(np.mean(explanation_confidences)),
+            "avg_predicted_variance_proxy": float(np.mean(variance_proxies)),
+            "avg_variance_weighted_explanation_error": float(np.mean(variance_weighted_errors)),
+        }
+    )
+    if interval_scales:
+        for c in coverages:
+            row[f"interval_scale_{_tag(c)}"] = float(interval_scales.get((mode, float(c)), 1.0))
+    return row
 
 
 def _subgroup_metric_rows(
@@ -989,6 +1443,9 @@ def _subgroup_metric_rows(
     mode: str,
     metadata: list[dict[str, float]] | None = None,
     reference_explanation_confidence: float | None = None,
+    normalized_predictors: dict[str, NormalizedConformalPredictor] | None = None,
+    interval_scales: dict[tuple[str, float], float] | None = None,
+    coverages: list[float] | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Compute subgroup metrics by surprise band and volatility regime."""
 
@@ -1019,6 +1476,9 @@ def _subgroup_metric_rows(
             mode=mode,
             metadata=subgroup_metadata,
             reference_explanation_confidence=reference_explanation_confidence,
+            normalized_predictors=normalized_predictors,
+            interval_scales=interval_scales,
+            coverages=coverages,
         )
         row["subgroup_type"] = subgroup_type
         row["subgroup"] = subgroup_name
@@ -1040,6 +1500,8 @@ def _prediction_rows(
     metadata: list[dict[str, float]] | None = None,
     financial_lookup: dict[tuple[str, str], dict[str, float]] | None = None,
     reference_explanation_confidence: float | None = None,
+    normalized_predictors: dict[str, NormalizedConformalPredictor] | None = None,
+    interval_scales: dict[tuple[str, float], float] | None = None,
 ) -> list[dict[str, float | str | int]]:
     """Build per-event prediction rows for export and lightweight inspection."""
 
@@ -1064,35 +1526,24 @@ def _prediction_rows(
     ):
         interval_bounds: dict[float, tuple[float, float]] = {}
         for coverage in (0.80, 0.90, 0.95):
-            if mode == "adaptive":
-                lower, upper = predictor.predict_interval(
-                    output=output,
-                    regime=regime,
-                    coverage=coverage,
-                    metadata=event_metadata,
-                )
-            elif mode == "naive":
-                lower, upper = _predict_interval_naive(output, coverage, global_thresholds)
-            elif mode == "confidence_scaled_naive":
-                lower, upper = _predict_interval_confidence_scaled_naive(
-                    output=output,
-                    coverage=coverage,
-                    global_thresholds=global_thresholds,
-                    explanation_confidence=float(
-                        event_metadata.get(
-                            "explanation_confidence",
-                            output.get("introspective_score", 0.0),
-                        )
-                    ),
-                    mean_explanation_confidence=mean_explanation_confidence,
-                )
-            else:
-                lower, upper = _predict_interval_without_adjustment(
-                    predictor,
-                    output,
-                    regime,
-                    coverage,
-                )
+            lower, upper = _unscaled_interval_for_mode(
+                mode=mode,
+                output=output,
+                regime=regime,
+                coverage=coverage,
+                predictor=predictor,
+                global_thresholds=global_thresholds,
+                metadata=event_metadata,
+                mean_explanation_confidence=mean_explanation_confidence,
+                normalized_predictors=normalized_predictors,
+            )
+            lower, upper = _apply_interval_scale(
+                output=output,
+                coverage=coverage,
+                lower=lower,
+                upper=upper,
+                scale=(interval_scales or {}).get((mode, float(coverage))),
+            )
             interval_bounds[coverage] = (float(lower), float(upper))
 
         raw_sentiment = event.get("sentiment_features", event.get("sentiment", [0.0, 0.0]))
@@ -1103,11 +1554,17 @@ def _prediction_rows(
         transcript_preview = transcript_text[:240].replace("\n", " ").strip()
         feature_values = _feature_triplet(event)
         mu = _point_prediction_for_method(output, method)
+        abs_error = abs(mu - float(label))
+        predicted_variance_proxy = _prediction_variance_proxy(output)
         explanation_confidence = float(
             event_metadata.get(
                 "explanation_confidence",
                 output.get("introspective_score", 0.0),
             )
+        )
+        explanation_adjusted_abs_error = abs_error / max(explanation_confidence, 1e-6)
+        variance_weighted_explanation_error = (
+            abs_error * predicted_variance_proxy / max(explanation_confidence, 1e-6)
         )
         financial_metadata = financial_lookup.get(
             (str(ticker).upper(), str(event.get("date", ""))),
@@ -1124,7 +1581,9 @@ def _prediction_rows(
                 "expected_return": mu,
                 "predicted_return": mu,
                 "actual_minus_expected": float(label) - mu,
+                "abs_error": abs_error,
                 "prediction_error": mu - float(label),
+                "predicted_variance_proxy": predicted_variance_proxy,
                 "predicted_q_low": float(output.get("q_low", mu)),
                 "predicted_q_high": float(output.get("q_high", mu)),
                 "base_interval_width": float(
@@ -1138,6 +1597,7 @@ def _prediction_rows(
                     )
                 ),
                 "introspective_score": float(output.get("introspective_score", 0.0)),
+                "variance_confidence": float(output.get("variance_confidence", 0.0)),
                 "coverage_80_lower": interval_bounds[0.80][0],
                 "coverage_80_upper": interval_bounds[0.80][1],
                 "interval_80": f"[{interval_bounds[0.80][0]:.4f}, {interval_bounds[0.80][1]:.4f}]",
@@ -1165,6 +1625,8 @@ def _prediction_rows(
                 "avg_sentiment": float(sentiment_values[0]),
                 "message_volume": float(sentiment_values[1]),
                 "explanation_confidence": explanation_confidence,
+                "explanation_adjusted_abs_error": explanation_adjusted_abs_error,
+                "variance_weighted_explanation_error": variance_weighted_explanation_error,
                 "modality_disagreement": float(
                     event_metadata.get("modality_disagreement", 0.0)
                 ),
@@ -1308,6 +1770,7 @@ def evaluate(config_path: str) -> None:
         raise ValueError(f"Could not build the requested evaluation split. {exc}") from exc
     _assert_disjoint_splits(train_events, val_events, cal_events, test_events)
     regime_thresholds = _load_regime_thresholds(config, train_events + val_events)
+    val_dataset = EarningsDataset(val_events, feature_stats=feature_stats)
     cal_dataset = EarningsDataset(cal_events, feature_stats=feature_stats)
     test_dataset = EarningsDataset(test_events, feature_stats=feature_stats)
     financial_lookup = _load_financial_lookup()
@@ -1323,13 +1786,26 @@ def evaluate(config_path: str) -> None:
 
     model = MultimodalForecastModel.load_from_config(str(config_file))
     state_dict = torch.load(model_path, map_location="cpu")
+    model_state = model.state_dict()
+    shape_mismatched_keys = [
+        key
+        for key, value in state_dict.items()
+        if key in model_state and tuple(value.shape) != tuple(model_state[key].shape)
+    ]
+    if shape_mismatched_keys:
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key not in shape_mismatched_keys
+        }
     load_result = model.load_state_dict(state_dict, strict=False)
     missing_keys = list(getattr(load_result, "missing_keys", []))
     unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
-    if missing_keys or unexpected_keys:
+    if missing_keys or unexpected_keys or shape_mismatched_keys:
         print(
             "Warning: loaded checkpoint with partial compatibility. "
-            f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}"
+            f"missing_keys={len(missing_keys)}, unexpected_keys={len(unexpected_keys)}, "
+            f"shape_mismatched_keys={len(shape_mismatched_keys)}"
         )
     model.eval()
     model.to(device)
@@ -1388,13 +1864,45 @@ def evaluate(config_path: str) -> None:
         use_attention_conditioning=True,
         use_explanation_adjustment=False,
     )
-    if include_selective_analysis:
-        event_conditioned_predictor.calibrate(
+    event_conditioned_predictor.calibrate(
+        cal_outputs=cal_outputs,
+        cal_labels=cal_labels,
+        cal_regimes=cal_regimes,
+        cal_metadata=cal_metadata,
+    )
+    normalized_predictors = {
+        "normalized_width": NormalizedConformalPredictor(
+            coverage_levels=coverage_levels,
+            difficulty="width",
+        ),
+        "normalized_modality": NormalizedConformalPredictor(
+            coverage_levels=coverage_levels,
+            difficulty="modality_disagreement",
+        ),
+        "normalized_combined": NormalizedConformalPredictor(
+            coverage_levels=coverage_levels,
+            difficulty="combined",
+        ),
+    }
+    for normalized_predictor in normalized_predictors.values():
+        normalized_predictor.calibrate(
             cal_outputs=cal_outputs,
             cal_labels=cal_labels,
-            cal_regimes=cal_regimes,
             cal_metadata=cal_metadata,
         )
+    interval_scales = _fit_interval_scales(
+        modes=["adaptive", "normalized_width", "normalized_modality", "normalized_combined"],
+        coverage_levels=coverage_levels,
+        cal_outputs=cal_outputs,
+        cal_labels=cal_labels,
+        cal_regimes=cal_regimes,
+        predictor=event_conditioned_predictor,
+        global_thresholds=global_thresholds,
+        cal_metadata=cal_metadata,
+        normalized_predictors=normalized_predictors,
+    )
+
+    selected_interval_modes: dict[str, str] = {}
 
     results_rows: list[dict[str, float | str]] = []
     subgroup_rows: list[dict[str, float | str | int]] = []
@@ -1407,34 +1915,45 @@ def evaluate(config_path: str) -> None:
         ("sentiment_only", "raw_quantile", event_conditioned_predictor),
         ("full_multimodal", "raw_quantile", event_conditioned_predictor),
         ("naive_conformal", "naive", event_conditioned_predictor),
-        ("ours", "confidence_scaled_naive", event_conditioned_predictor),
+        ("event_conditioned_conformal", "adaptive", event_conditioned_predictor),
+        ("normalized_conformal_width", "normalized_width", event_conditioned_predictor),
+        ("normalized_conformal_modality", "normalized_modality", event_conditioned_predictor),
+        ("normalized_conformal_combined", "normalized_combined", event_conditioned_predictor),
+        ("ours", "normalized_modality", event_conditioned_predictor),
     ]
 
-    for method, mode, _active_predictor in evaluation_specs:
-        base_method = "full_multimodal" if method in {"full_multimodal", "naive_conformal", "ours"} else method
-        outputs, labels, regimes, _tickers = _compute_model_outputs(
-            model=model,
-            events=test_events,
-            dataset=test_dataset,
-            method=base_method,
-            device=device,
-            regime_thresholds=regime_thresholds,
-        )
-        if base_method == "full_multimodal":
-            test_full_outputs = outputs
-            test_labels = labels
-            test_regimes = regimes
-            test_tickers = _tickers
-            continue
-        if base_method == "text_only":
-            test_text_outputs = outputs
-            continue
-        if base_method == "financial_only":
-            test_financial_outputs = outputs
-            continue
-        if base_method == "sentiment_only":
-            test_sentiment_outputs = outputs
-            continue
+    test_full_outputs, test_labels, test_regimes, test_tickers = _compute_model_outputs(
+        model=model,
+        events=test_events,
+        dataset=test_dataset,
+        method="full_multimodal",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    test_text_outputs, _text_labels, _text_regimes, _text_tickers = _compute_model_outputs(
+        model=model,
+        events=test_events,
+        dataset=test_dataset,
+        method="text_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    test_financial_outputs, _fin_labels, _fin_regimes, _fin_tickers = _compute_model_outputs(
+        model=model,
+        events=test_events,
+        dataset=test_dataset,
+        method="financial_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    test_sentiment_outputs, _sent_labels, _sent_regimes, _sent_tickers = _compute_model_outputs(
+        model=model,
+        events=test_events,
+        dataset=test_dataset,
+        method="sentiment_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
 
     test_metadata, _unused_center, _unused_scale = _build_explanation_metadata(
         events=test_events,
@@ -1452,25 +1971,34 @@ def evaluate(config_path: str) -> None:
         "sentiment_only": (test_sentiment_outputs, test_labels, test_regimes, test_tickers),
         "full_multimodal": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "naive_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "event_conditioned_conformal": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "normalized_conformal_width": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "normalized_conformal_modality": (test_full_outputs, test_labels, test_regimes, test_tickers),
+        "normalized_conformal_combined": (test_full_outputs, test_labels, test_regimes, test_tickers),
         "ours": (test_full_outputs, test_labels, test_regimes, test_tickers),
     }
 
     for method, mode, active_predictor in evaluation_specs:
+        effective_mode = selected_interval_modes.get(method, mode)
         outputs, labels, regimes, _tickers = method_payloads[method]
 
-        results_rows.append(
-            _metric_row(
-                method=method,
-                outputs=outputs,
-                labels=labels,
-                regimes=regimes,
-                predictor=active_predictor,
-                global_thresholds=global_thresholds,
-                mode=mode,
-                metadata=test_metadata,
-                reference_explanation_confidence=calibration_explanation_confidence,
-            )
+        result_row = _metric_row(
+            method=method,
+            outputs=outputs,
+            labels=labels,
+            regimes=regimes,
+            predictor=active_predictor,
+            global_thresholds=global_thresholds,
+            mode=effective_mode,
+            metadata=test_metadata,
+            reference_explanation_confidence=calibration_explanation_confidence,
+            normalized_predictors=normalized_predictors,
+            interval_scales=interval_scales,
+            coverages=coverage_levels,
         )
+        result_row["selected_interval_mode"] = effective_mode
+        result_row["candidate_interval_mode"] = mode
+        results_rows.append(result_row)
         prediction_rows.extend(
             _prediction_rows(
                 method=method,
@@ -1481,10 +2009,12 @@ def evaluate(config_path: str) -> None:
                 tickers=_tickers,
                 predictor=active_predictor,
                 global_thresholds=global_thresholds,
-                mode=mode,
+                mode=effective_mode,
                 metadata=test_metadata,
                 financial_lookup=financial_lookup,
                 reference_explanation_confidence=calibration_explanation_confidence,
+                normalized_predictors=normalized_predictors,
+                interval_scales=interval_scales,
             )
         )
         if include_selective_analysis and method == "ours":
@@ -1495,7 +2025,7 @@ def evaluate(config_path: str) -> None:
                     regimes=regimes,
                     predictor=active_predictor,
                     global_thresholds=global_thresholds,
-                    mode=mode,
+                    mode=effective_mode,
                     min_scores=[
                         float(score)
                         for score in config.get("calibration", {}).get(
@@ -1515,9 +2045,12 @@ def evaluate(config_path: str) -> None:
                 regimes=regimes,
                 predictor=active_predictor,
                 global_thresholds=global_thresholds,
-                mode=mode,
+                mode=effective_mode,
                 metadata=test_metadata,
                 reference_explanation_confidence=calibration_explanation_confidence,
+                normalized_predictors=normalized_predictors,
+                interval_scales=interval_scales,
+                coverages=coverage_levels,
             )
         )
 
@@ -1536,6 +2069,7 @@ def evaluate(config_path: str) -> None:
             global_thresholds=global_thresholds,
             mode="naive",
             reference_explanation_confidence=calibration_explanation_confidence,
+            coverages=coverage_levels,
         )
     )
     prediction_rows.extend(
@@ -1563,6 +2097,7 @@ def evaluate(config_path: str) -> None:
             global_thresholds=global_thresholds,
             mode="naive",
             reference_explanation_confidence=calibration_explanation_confidence,
+            coverages=coverage_levels,
         )
     )
 
@@ -1570,28 +2105,57 @@ def evaluate(config_path: str) -> None:
     subgroup_results_table = pd.DataFrame(subgroup_rows)
     selective_results_table = pd.DataFrame(selective_rows)
     predictions_table = pd.DataFrame(prediction_rows)
-    display_columns = [
-        "method",
-        "coverage_80",
-        "coverage_90",
-        "coverage_95",
-        "avg_width",
-        "MAE",
-        "RMSE",
-        "dir_acc",
+
+    point_methods = [
+        "text_only",
+        "financial_only",
+        "sentiment_only",
+        "full_multimodal",
+        "same_ticker_baseline",
     ]
-    print(tabulate(results_table[display_columns], headers="keys", tablefmt="github", showindex=False))
+    interval_methods = [
+        "full_multimodal",
+        "naive_conformal",
+        "event_conditioned_conformal",
+        "normalized_conformal_width",
+        "normalized_conformal_modality",
+        "normalized_conformal_combined",
+        "ours",
+        "same_ticker_baseline",
+    ]
+    point_columns = ["method", "MAE", "RMSE", "dir_acc"]
+    coverage_tags = [f"{int(round(float(c) * 100))}" for c in coverage_levels]
+    interval_columns = (
+        ["method", "selected_interval_mode", "candidate_interval_mode"]
+        + [f"coverage_{tag}" for tag in coverage_tags]
+        + [f"avg_width_{tag}" for tag in coverage_tags]
+        + ["avg_width"]
+        + [f"cal_error_{tag}" for tag in coverage_tags]
+        + ["calibration_error"]
+    )
+    point_table = (
+        results_table[results_table["method"].isin(point_methods)][point_columns]
+        .set_index("method")
+        .reindex([m for m in point_methods if m in set(results_table["method"])])
+        .reset_index()
+    )
+    interval_table = (
+        results_table[results_table["method"].isin(interval_methods)][interval_columns]
+        .set_index("method")
+        .reindex([m for m in interval_methods if m in set(results_table["method"])])
+        .reset_index()
+    )
+
+    print("Point-forecast comparison")
+    print(tabulate(point_table, headers="keys", tablefmt="github", showindex=False))
+    print("\nInterval comparison")
+    print(tabulate(interval_table, headers="keys", tablefmt="github", showindex=False))
     if not subgroup_results_table.empty:
-        subgroup_display_columns = [
-            "method",
-            "subgroup_type",
-            "subgroup",
-            "n",
-            "coverage_80",
-            "coverage_90",
-            "coverage_95",
-            "avg_width",
-        ]
+        subgroup_display_columns = (
+            ["method", "subgroup_type", "subgroup", "n"]
+            + [f"coverage_{tag}" for tag in coverage_tags]
+            + ["avg_width", "calibration_error"]
+        )
         print(
             tabulate(
                 subgroup_results_table[subgroup_display_columns],
@@ -1620,6 +2184,10 @@ def evaluate(config_path: str) -> None:
     root_selective_results_path = PROJECT_ROOT / "results_selective.csv"
     results_table.to_csv(experiments_results_path, index=False)
     results_table.to_csv(root_results_path, index=False)
+    point_table.to_csv(PROJECT_ROOT / "experiments" / "results_point.csv", index=False)
+    point_table.to_csv(PROJECT_ROOT / "results_point.csv", index=False)
+    interval_table.to_csv(PROJECT_ROOT / "experiments" / "results_intervals.csv", index=False)
+    interval_table.to_csv(PROJECT_ROOT / "results_intervals.csv", index=False)
     subgroup_results_table.to_csv(experiments_subgroup_results_path, index=False)
     subgroup_results_table.to_csv(root_subgroup_results_path, index=False)
     predictions_table.to_csv(experiments_predictions_path, index=False)
