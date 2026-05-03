@@ -58,7 +58,9 @@ def main() -> None:
     assert len(results) >= 7, "results.csv must contain at least 7 method rows"
 
     methods = [str(x) for x in results["method"].tolist()]
-    assert "ours" in methods, "Missing required ours method row"
+    assert (
+        "normalized_conformal_modality" in methods
+    ), "Missing required normalized_conformal_modality method row"
     assert len(set(methods)) >= 7, "There must be at least 7 distinct method rows"
 
     required_columns = [
@@ -81,10 +83,12 @@ def main() -> None:
         assert (results[cov_col] >= 0.0).all(), "Coverage must be >= 0"
         assert (results[cov_col] <= 1.0).all(), "Coverage must be <= 1"
 
-    ours = results.loc[results["method"] == "ours"]
-    assert len(ours) == 1, "There must be exactly one ours row"
-    ours_row = ours.iloc[0]
-    assert ours_row["coverage_95"] >= ours_row["coverage_80"], "ours coverage_95 must be >= coverage_80"
+    normalized = results.loc[results["method"] == "normalized_conformal_modality"]
+    assert len(normalized) == 1, "There must be exactly one normalized conformal row"
+    normalized_row = normalized.iloc[0]
+    assert (
+        normalized_row["coverage_95"] >= normalized_row["coverage_80"]
+    ), "normalized coverage_95 must be >= coverage_80"
 
     assert (results["dir_acc"] >= 0.0).all(), "dir_acc must be >= 0"
     assert (results["dir_acc"] <= 1.0).all(), "dir_acc must be <= 1"

@@ -264,6 +264,9 @@ class EventConditionedConformalPredictor:
         self.minimum_bucket_size = max(int(minimum_bucket_size), 8)
         self.use_attention_conditioning = bool(use_attention_conditioning)
         self.thresholds: dict[tuple[str, float], float] = {}
+        self.global_thresholds: dict[float, float] = {}
+        self.bucket_counts: dict[tuple[str, float], int] = {}
+        self.threshold_sources: dict[tuple[str, float], str] = {}
         self.attention_band_thresholds: dict[tuple[str, str, float], float] = {}
         self.global_attention_band_thresholds: dict[tuple[str, float], float] = {}
         self.attention_band_edges: dict[str, float] | None = None
@@ -297,10 +300,14 @@ class EventConditionedConformalPredictor:
             raise ValueError("Calibration metadata must align with calibration outputs.")
 
         self.thresholds.clear()
+        self.global_thresholds.clear()
+        self.bucket_counts.clear()
+        self.threshold_sources.clear()
         self.attention_band_thresholds.clear()
         self.global_attention_band_thresholds.clear()
 
         regime_scores: dict[tuple[str, float], list[float]] = {}
+        global_scores: dict[float, list[float]] = {}
         calibration_rows: list[dict[str, float | str]] = []
         attention_values: list[float] = []
 
@@ -318,6 +325,7 @@ class EventConditionedConformalPredictor:
                 q_low, q_high = _interval_bounds(output, coverage=float(coverage))
                 nonconformity = max(q_low - float(label), float(label) - q_high)
                 regime_scores.setdefault((normalized_regime, float(coverage)), []).append(nonconformity)
+                global_scores.setdefault(float(coverage), []).append(nonconformity)
                 calibration_rows.append(
                     {
                         "regime": normalized_regime,
@@ -327,12 +335,29 @@ class EventConditionedConformalPredictor:
                     }
                 )
 
-        for (regime, coverage), scores in regime_scores.items():
+        for coverage, scores in global_scores.items():
             n = len(scores)
             if n == 0:
                 continue
             quantile_level = coverage * (1.0 + 1.0 / n)
-            self.thresholds[(regime, float(coverage))] = _conformal_quantile(scores, quantile_level)
+            self.global_thresholds[float(coverage)] = _conformal_quantile(scores, quantile_level)
+
+        for regime in VALID_REGIMES:
+            for coverage in self.coverage_levels:
+                coverage = float(coverage)
+                scores = regime_scores.get((regime, coverage), [])
+                n = len(scores)
+                self.bucket_counts[(regime, coverage)] = n
+                if n >= self.minimum_bucket_size:
+                    quantile_level = coverage * (1.0 + 1.0 / n)
+                    self.thresholds[(regime, coverage)] = _conformal_quantile(
+                        scores,
+                        quantile_level,
+                    )
+                    self.threshold_sources[(regime, coverage)] = "regime"
+                elif coverage in self.global_thresholds:
+                    self.thresholds[(regime, coverage)] = self.global_thresholds[coverage]
+                    self.threshold_sources[(regime, coverage)] = "global_fallback"
 
         self.attention_band_edges = _fit_band_edges(attention_values, 0.50, 0.85)
         self._fit_auxiliary_thresholds(
@@ -404,6 +429,8 @@ class EventConditionedConformalPredictor:
             "observable_threshold": base_threshold,
             "attention_band": "medium",
             "attention_source": "regime_only",
+            "threshold_source": self.threshold_sources.get(threshold_key, "regime"),
+            "bucket_count": float(self.bucket_counts.get(threshold_key, 0)),
         }
 
         attention_band = _assign_band(message_volume, self.attention_band_edges)

@@ -14,4 +14,12 @@ data/external/*
 !data/processed/.gitkeep
 home/
 data/collect_errors.log
+
+# Training/evaluation artifacts and caches
+data/transcript_cache/
+data/transcript_cache_eval/
+data/events_cache.pt
+data/events_cache.pt.bak
+experiments/model*.pt
+model.pt
 data/build_cache_errors.log
