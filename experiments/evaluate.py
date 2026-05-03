@@ -1138,11 +1138,7 @@ def _fit_interval_scales(
 
     for mode in modes:
         for coverage in coverage_levels:
-            target_coverage = (
-                _adaptive_tuning_target(float(coverage), len(cal_labels))
-                if mode.startswith("normalized_")
-                else float(coverage)
-            )
+            target_coverage = float(coverage)
             candidates: list[tuple[float, float, float]] = []
             unscaled_bounds = [
                 _unscaled_interval_for_mode(
@@ -1843,6 +1839,38 @@ def evaluate(config_path: str) -> None:
         device=device,
         regime_thresholds=regime_thresholds,
     )
+    val_outputs, val_labels, val_regimes, _ = _compute_model_outputs(
+        model=model,
+        events=val_events,
+        dataset=val_dataset,
+        method="full_multimodal",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    val_text_outputs, _val_text_labels, _val_text_regimes, _ = _compute_model_outputs(
+        model=model,
+        events=val_events,
+        dataset=val_dataset,
+        method="text_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    val_financial_outputs, _val_fin_labels, _val_fin_regimes, _ = _compute_model_outputs(
+        model=model,
+        events=val_events,
+        dataset=val_dataset,
+        method="financial_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
+    val_sentiment_outputs, _val_sent_labels, _val_sent_regimes, _ = _compute_model_outputs(
+        model=model,
+        events=val_events,
+        dataset=val_dataset,
+        method="sentiment_only",
+        device=device,
+        regime_thresholds=regime_thresholds,
+    )
 
     coverage_levels = list(config.get("calibration", {}).get("coverage_levels", [0.80, 0.90, 0.95]))
     include_selective_analysis = bool(
@@ -1855,6 +1883,15 @@ def evaluate(config_path: str) -> None:
         text_outputs=cal_text_outputs,
         financial_outputs=cal_financial_outputs,
         sentiment_outputs=cal_sentiment_outputs,
+    )
+    val_metadata, _val_disagreement_center, _val_disagreement_scale = _build_explanation_metadata(
+        events=val_events,
+        full_outputs=val_outputs,
+        text_outputs=val_text_outputs,
+        financial_outputs=val_financial_outputs,
+        sentiment_outputs=val_sentiment_outputs,
+        reference_center=disagreement_center,
+        reference_scale=disagreement_scale,
     )
     calibration_explanation_confidence = _mean_explanation_confidence(cal_metadata)
     global_thresholds = _build_global_thresholds(cal_outputs, cal_labels, coverage_levels)
@@ -1893,12 +1930,12 @@ def evaluate(config_path: str) -> None:
     interval_scales = _fit_interval_scales(
         modes=["adaptive", "normalized_width", "normalized_modality", "normalized_combined"],
         coverage_levels=coverage_levels,
-        cal_outputs=cal_outputs,
-        cal_labels=cal_labels,
-        cal_regimes=cal_regimes,
+        cal_outputs=val_outputs,
+        cal_labels=val_labels,
+        cal_regimes=val_regimes,
         predictor=event_conditioned_predictor,
         global_thresholds=global_thresholds,
-        cal_metadata=cal_metadata,
+        cal_metadata=val_metadata,
         normalized_predictors=normalized_predictors,
     )
 

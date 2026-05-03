@@ -332,7 +332,10 @@ objective of getting empirical coverage closer to 80/90/95 while keeping
 intervals narrow. The normalized tuning target subtracts `1.5` binomial
 standard errors from the nominal level on the calibration set, which offsets
 the overcoverage that otherwise made the adaptive rows collapse toward the
-naive conservative intervals.
+naive conservative intervals. After thresholds are fit on the calibration
+split, a held-out validation split selects a separate correction multiplier for
+each coverage level and interval mode by minimizing coverage error, with width
+used as the tie-breaker.
 
 The ablation table reports each conformal method directly rather than silently
 falling back to another interval rule. In the default setup, `ours` is the
